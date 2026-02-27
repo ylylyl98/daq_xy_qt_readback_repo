@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daq-xy-qt-readback"
+version = "0.1.0"
+description = "PyQt6 XY-pad UI for NI-DAQ AO control with ramping and optional readback."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["PyQt6>=6.5"]
+
+[project.scripts]
+daq-xy-ui = "daq_xy_qt_readback.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
