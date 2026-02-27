@@ -4,7 +4,7 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 
 - Output transitions are ramped (no instant jumps).
 - Includes `Home` and `Ground (ramp to 0 V)` actions.
-- Uses `iv_automation.DaqControl` when available, otherwise falls back to a simulator.
+- Uses `iv_automation.DaqControl` with a real NI-DAQ device (no simulator fallback).
 
 ## Run the app
 
@@ -66,11 +66,12 @@ daq_xy_qt_readback_repo/
 ## Hardware wrapper (`iv_automation`)
 
 For real hardware I/O, `iv_automation.py` must be importable in the same environment.
-If unavailable, the app runs in simulator mode.
+If unavailable, app startup fails with a clear error.
 
 ## Troubleshooting
 
 - `No module named daq_xy_qt_readback`: set `PYTHONPATH=src` (manual mode) or use `pip install -e .`.
 - `No module named PyQt6`: run `python -m pip install -r requirements.txt`.
+- `Real DAQ control is unavailable`: install/import `iv_automation.py` dependencies (`nidaqmx`, `pyvisa`, `numpy`) in the same environment.
 - Window fails to open with DAQ errors: verify device/channel names (`--dev`, `--ao-x`, `--ao-y`) and NI-DAQ availability.
 - If GUI launch works but hardware writes do not: confirm `iv_automation.DaqControl` methods are available in your environment.
