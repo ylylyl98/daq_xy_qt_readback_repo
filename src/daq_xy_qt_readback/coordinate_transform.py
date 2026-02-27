@@ -108,6 +108,27 @@ def load_coordinate_settings(path: str | None, default: CoordinateSettings) -> C
         return default
 
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return coordinate_settings_from_dict(payload, default)
+
+
+def coordinate_settings_to_dict(settings: CoordinateSettings) -> dict[str, Any]:
+    """Serialize settings to a JSON-compatible dictionary."""
+    settings.validate()
+    return {
+        "axis_map": {"u": settings.axis_map.u, "v": settings.axis_map.v},
+        "axis_polarity": {"u": settings.axis_polarity.u, "v": settings.axis_polarity.v},
+        "voltage_range": {"min": settings.voltage_range.min_v, "max": settings.voltage_range.max_v},
+        "transform": {
+            "rotation_deg": settings.transform.rotation_deg,
+            "rotate_about": settings.transform.rotate_about,
+            "offset_uv": [settings.transform.offset_u, settings.transform.offset_v],
+        },
+        "on_out_of_range": settings.on_out_of_range,
+    }
+
+
+def coordinate_settings_from_dict(payload: dict[str, Any], default: CoordinateSettings) -> CoordinateSettings:
+    """Parse a dictionary into validated coordinate settings."""
     if not isinstance(payload, dict):
         raise ValueError("Coordinate config root must be a JSON object")
 
@@ -265,4 +286,3 @@ def ao_volts_to_physical_uv(ao_volts: dict[str, float], settings: CoordinateSett
     u = _remove_polarity(float(ao_volts[settings.axis_map.u]), settings.axis_polarity.u, vmin, vmax)
     v = _remove_polarity(float(ao_volts[settings.axis_map.v]), settings.axis_polarity.v, vmin, vmax)
     return u, v
-

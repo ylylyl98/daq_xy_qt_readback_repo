@@ -5,6 +5,7 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 - Output transitions are ramped (no instant jumps).
 - Includes `Home` and `Ground (ramp to 0 V)` actions.
 - Uses `iv_automation.DaqControl` with a real NI-DAQ device (no simulator fallback).
+- Uses a persistent local controller process that owns the AO task, so closing/reopening the UI does not move outputs.
 
 ## Run the app
 
@@ -99,6 +100,18 @@ Notes:
 - Pipeline is centralized and applied to all manual scanner moves:
   logical `(x,y)` -> physical `(u,v)` -> AO channel voltages.
 - `rotate_about` supports `origin` or `center` (center = midpoint of configured voltage range).
+
+## Safety / Restart behavior
+
+- UI startup does **not** write AO outputs.
+- UI reads controller state/config and initializes widgets with signal blocking.
+- Controller process keeps NI-DAQ AO task ownership while UI closes/reopens.
+- AO changes only when output is enabled and a move/jog command is issued.
+- Close the UI window does not reset AO.
+
+Persisted files (Windows default `%APPDATA%\daq_xy_qt_readback`):
+- `coord_config.json` (mapping, inversion, rotation, range, behavior)
+- `scanner_state.json` (last logical and AO outputs)
 
 ## Troubleshooting
 

@@ -28,8 +28,9 @@ Requires:
 from __future__ import annotations
 
 import sys
-import logging
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Tuple
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -40,27 +41,16 @@ from PyQt6.QtWidgets import (
 )
 from .coordinate_transform import (
     CoordinateSettings,
-    ao_volts_to_physical_uv,
-    load_coordinate_settings,
-    logical_xy_to_physical_uv,
-    physical_uv_to_ao_volts,
-    physical_uv_to_logical_xy,
+    coordinate_settings_from_dict,
+    coordinate_settings_to_dict,
 )
+from .controller_client import ControllerClient, ensure_controller_running
 
 STEP_PER_MOVE = 0.05
-LOGGER = logging.getLogger(__name__)
 
 # ---------------- DAQ backend ----------------
 def _clamp(v: float, lo: float = 0.0, hi: float = 10.0) -> float:
     return max(lo, min(hi, float(v)))
-
-try:
-    from iv_automation import DaqControl as _RealDaqControl  # real hardware wrapper
-    _DAQ_IMPORT_ERROR: Exception | None = None
-except Exception as exc:
-    _RealDaqControl = None
-    _DAQ_IMPORT_ERROR = exc
-
 
 def _next_ramp_point(
     x: float,
@@ -76,88 +66,6 @@ def _next_ramp_point(
     if dist <= step:
         return target_x, target_y
     return x + (dx / dist) * step, y + (dy / dist) * step
-
-
-class DaqInterface:
-    """Thin adapter around the DAQ backend with safe read fallbacks."""
-
-    def __init__(
-        self,
-        dev_name: str,
-        ao_x: str,
-        ao_y: str,
-        coord_settings: CoordinateSettings | None = None,
-    ) -> None:
-        if _RealDaqControl is None:
-            raise RuntimeError(
-                "Real DAQ control is unavailable. Ensure iv_automation.py and its "
-                "dependencies (nidaqmx, pyvisa, numpy) are installed."
-            ) from _DAQ_IMPORT_ERROR
-        self.settings = coord_settings or CoordinateSettings.default_for_channels(ao_x, ao_y)
-        self.settings.validate()
-        self._daq = _RealDaqControl(dev_name)
-        configured_channels = {ao_x, ao_y}
-        mapped_channels = {self.settings.axis_map.u, self.settings.axis_map.v}
-        if mapped_channels != configured_channels:
-            raise ValueError(
-                "axis_map must use exactly the configured channels "
-                f"{sorted(configured_channels)}, got {sorted(mapped_channels)}"
-            )
-        self._channel_to_var = {
-            ao_x: "ch0_v",
-            ao_y: "ch1_v",
-        }
-        self._x, self._y = self.settings.voltage_range.min_v, self.settings.voltage_range.min_v
-        self._daq.add_ao_channel(ao_x, self._channel_to_var[ao_x])
-        self._daq.add_ao_channel(ao_y, self._channel_to_var[ao_y])
-        self._receive()
-
-    def read_measured_xy(self) -> Tuple[float, float]:
-        try:
-            self._daq.read_y()
-            measured_ao = {
-                ch: float(self._daq.send_y("measured_" + var_name))
-                for ch, var_name in self._channel_to_var.items()
-            }
-            u, v = ao_volts_to_physical_uv(measured_ao, self.settings)
-            x, y = physical_uv_to_logical_xy(u, v, self.settings)
-            return _clamp(x), _clamp(y)
-        except Exception:
-            LOGGER.debug("Falling back to last set XY when measured readback fails.", exc_info=True)
-            return self._x, self._y
-
-    def _receive(self) -> None:
-        u, v = logical_xy_to_physical_uv(self._x, self._y, self.settings)
-        ao_volts, clamped = physical_uv_to_ao_volts(u, v, self.settings)
-        if clamped:
-            LOGGER.warning(
-                "Coordinate command was clamped to voltage range [%s, %s].",
-                self.settings.voltage_range.min_v,
-                self.settings.voltage_range.max_v,
-            )
-        for channel, var_name in self._channel_to_var.items():
-            self._daq.receive_x(var_name, ao_volts[channel])
-
-    def write_xy(self, x_v: float, y_v: float) -> Tuple[float, float]:
-        self._x = _clamp(x_v, self.settings.voltage_range.min_v, self.settings.voltage_range.max_v)
-        self._y = _clamp(y_v, self.settings.voltage_range.min_v, self.settings.voltage_range.max_v)
-        self._receive()
-        self._daq.write_x()
-        try:
-            self._daq.read_y()
-        except Exception:
-            LOGGER.debug("DAQ readback failed after write; continuing with setpoints.", exc_info=True)
-        return self._x, self._y
-
-    def close(self) -> None:
-        try:
-            self._daq.ao_task.close()
-        except Exception:
-            LOGGER.debug("Failed closing AO task.", exc_info=True)
-        try:
-            self._daq.ai_task.close()
-        except Exception:
-            LOGGER.debug("Failed closing AI task.", exc_info=True)
 
 
 # ---------------- XY Pad ----------------
@@ -231,28 +139,30 @@ class DaqXYWindow(QMainWindow):
 
     def __init__(
         self,
-        dev_name: str = "Dev1",
-        ao_x: str = "ao0",
-        ao_y: str = "ao1",
-        coord_settings: CoordinateSettings | None = None,
+        controller: ControllerClient,
+        initial_state: dict[str, float],
+        settings: CoordinateSettings,
     ) -> None:
         super().__init__()
         self.setWindowTitle(f"NI-DAQ XY Control (AO0/AO1) - Ramped {STEP_PER_MOVE}V @ 100ms")
+        self._controller = controller
+        self._initializing = True
         self._enabled = False
-        self._daq = DaqInterface(dev_name, ao_x, ao_y, coord_settings=coord_settings)
-        self._vmin = self._daq.settings.voltage_range.min_v
-        self._vmax = self._daq.settings.voltage_range.max_v
-        mx, my = self._daq.read_measured_xy()
-        self._x = mx
-        self._y = my
-        self._target_x = mx
-        self._target_y = my
+        self._settings = settings
+        self._vmin = settings.voltage_range.min_v
+        self._vmax = settings.voltage_range.max_v
+        self._jog_step = STEP_PER_MOVE
+        self._x = _clamp(float(initial_state.get("logical_x", self._vmin)), self._vmin, self._vmax)
+        self._y = _clamp(float(initial_state.get("logical_y", self._vmin)), self._vmin, self._vmax)
+        self._target_x = self._x
+        self._target_y = self._y
         self.ramp = RampConfig()
         self._ramp_timer = QTimer(self)
         self._ramp_timer.timeout.connect(self._ramp_step)
 
         self._build_ui()
         self._sync_ui()
+        self._initializing = False
 
     # ---- UI construction ----
     def _build_ui(self) -> None:
@@ -263,7 +173,8 @@ class DaqXYWindow(QMainWindow):
         # Top controls (no Emergency Stop)
         top = QHBoxLayout()
         self.chk_enable = QCheckBox("Enable Output")
-        self.btn_home = QPushButton("Home (5V,5V)")
+        center_v = (self._vmin + self._vmax) / 2.0
+        self.btn_home = QPushButton(f"Home ({center_v:.1f}V,{center_v:.1f}V)")
         self.btn_ground = QPushButton("Ground (ramp to 0V)")
         top.addWidget(self.chk_enable)
         top.addWidget(self.btn_home)
@@ -293,7 +204,7 @@ class DaqXYWindow(QMainWindow):
         center.addWidget(sliders_box, 3)
 
         # Nudge (fixed 0.1 V)
-        right_box = QGroupBox(f"Nudge (+/-{STEP_PER_MOVE} V each)")
+        right_box = QGroupBox(f"Nudge (+/-{self._jog_step} V each)")
         rgrid = QGridLayout(right_box)
         self.btn_left  = QPushButton("Left")
         self.btn_right = QPushButton("Right")
@@ -314,7 +225,7 @@ class DaqXYWindow(QMainWindow):
 
         # Connections
         self.chk_enable.toggled.connect(self._on_enable_toggled)
-        self.btn_home.clicked.connect(lambda: self.set_target_volts(5.0, 5.0))
+        self.btn_home.clicked.connect(lambda: self.set_target_volts(center_v, center_v))
         self.btn_ground.clicked.connect(self.ground)
         self.pad.clicked.connect(lambda xv, yv: self.set_target_volts(xv, yv))
 
@@ -323,10 +234,10 @@ class DaqXYWindow(QMainWindow):
         self.spn_x.valueChanged.connect(lambda v: self._on_slider_spin_changed('x', v))
         self.spn_y.valueChanged.connect(lambda v: self._on_slider_spin_changed('y', v))
 
-        self.btn_left.clicked.connect(lambda: self._nudge(-STEP_PER_MOVE,  0.0))
-        self.btn_right.clicked.connect(lambda: self._nudge(+STEP_PER_MOVE,  0.0))
-        self.btn_up.clicked.connect(lambda: self._nudge( 0.0,  +STEP_PER_MOVE))
-        self.btn_down.clicked.connect(lambda: self._nudge( 0.0,  -STEP_PER_MOVE))
+        self.btn_left.clicked.connect(lambda: self._nudge(-self._jog_step,  0.0))
+        self.btn_right.clicked.connect(lambda: self._nudge(+self._jog_step,  0.0))
+        self.btn_up.clicked.connect(lambda: self._nudge( 0.0,  +self._jog_step))
+        self.btn_down.clicked.connect(lambda: self._nudge( 0.0,  -self._jog_step))
 
     def _hbox(self, *widgets: QWidget) -> QWidget:
         w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0)
@@ -361,6 +272,8 @@ class DaqXYWindow(QMainWindow):
 
     # ---- Actions ----
     def _on_enable_toggled(self, checked: bool) -> None:
+        if self._initializing:
+            return
         self._enabled = bool(checked)
         # No forced zeroing on disable (to avoid sudden jumps)
         if not self._enabled:
@@ -368,6 +281,8 @@ class DaqXYWindow(QMainWindow):
         self._update_status()
 
     def _on_slider_spin_changed(self, axis: str, value: float) -> None:
+        if self._initializing:
+            return
         if axis == 'x':
             self.set_target_volts(value, self._target_y)
         else:
@@ -398,7 +313,7 @@ class DaqXYWindow(QMainWindow):
         if not self._enabled:
             # Turn on output so the ramp can proceed safely.
             self.chk_enable.setChecked(True)
-        self.set_target_volts(0.0, 0.0)
+        self.set_target_volts(self._vmin, self._vmin)
 
     # ---- ramping (fixed 0.1 V / 50 ms) ----
     def _start_ramp(self) -> None:
@@ -421,16 +336,15 @@ class DaqXYWindow(QMainWindow):
         step = self.ramp.step_v  # 0.1 V fixed
         nx, ny = _next_ramp_point(self._x, self._y, self._target_x, self._target_y, step)
 
-        self._x, self._y = self._daq.write_xy(_clamp(nx), _clamp(ny))
+        state = self._controller.move_logical(_clamp(nx, self._vmin, self._vmax), _clamp(ny, self._vmin, self._vmax))
+        self._x = _clamp(float(state.get("logical_x", nx)), self._vmin, self._vmax)
+        self._y = _clamp(float(state.get("logical_y", ny)), self._vmin, self._vmax)
         self._sync_ui()
 
     # Clean close
     def closeEvent(self, e: Any) -> None:  # type: ignore[override]
-        try:
-            self._ramp_timer.stop()
-            self._daq.close()
-        finally:
-            super().closeEvent(e)
+        self._ramp_timer.stop()
+        super().closeEvent(e)
 
 
 # ---------------- Launchers ----------------
@@ -445,19 +359,45 @@ def _ensure_qt_in_notebook() -> None:
         pass
 
 
+def _window_from_controller(client: ControllerClient) -> DaqXYWindow:
+    state = client.get_state()
+    config_dict = client.get_config()
+    settings = coordinate_settings_from_dict(
+        config_dict,
+        CoordinateSettings.default_for_channels("ao0", "ao1"),
+    )
+    return DaqXYWindow(controller=client, initial_state=state, settings=settings)
+
+
 def _auto_window(
     dev_name: str = "Dev1",
     ao_x: str = "ao0",
     ao_y: str = "ao1",
-    coord_settings: CoordinateSettings | None = None,
+    coord_config_path: str | None = None,
+    fake_backend: bool = False,
 ) -> DaqXYWindow:
+    def _apply_config_if_requested(client: ControllerClient) -> None:
+        if not coord_config_path:
+            return
+        cfg = coordinate_settings_to_dict(
+            coordinate_settings_from_dict(
+                json.loads(Path(coord_config_path).read_text(encoding="utf-8")),
+                CoordinateSettings.default_for_channels(ao_x, ao_y),
+            )
+        )
+        client.set_config(cfg)
+
     # Try Dev1 then Dev2 if first attempt fails
     try:
-        return DaqXYWindow(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y, coord_settings=coord_settings)
+        client = ensure_controller_running(dev_name, ao_x, ao_y, fake_backend=fake_backend)
+        _apply_config_if_requested(client)
+        return _window_from_controller(client)
     except Exception as e1:
         if dev_name.lower() == "dev1":
             try:
-                return DaqXYWindow(dev_name="Dev2", ao_x=ao_x, ao_y=ao_y, coord_settings=coord_settings)
+                client = ensure_controller_running("Dev2", ao_x, ao_y, fake_backend=fake_backend)
+                _apply_config_if_requested(client)
+                return _window_from_controller(client)
             except Exception:
                 raise e1
         raise
@@ -468,15 +408,18 @@ def launch(
     ao_x: str = "ao0",
     ao_y: str = "ao1",
     coord_config_path: str | None = None,
+    fake_backend: bool = False,
 ) -> Tuple[QApplication, DaqXYWindow]:
     """Non-blocking launcher ideal for notebooks. Returns (app, window)."""
     app = QApplication.instance() or QApplication(sys.argv)
     _ensure_qt_in_notebook()
-    settings = load_coordinate_settings(
-        coord_config_path,
-        CoordinateSettings.default_for_channels(ao_x, ao_y),
+    win = _auto_window(
+        dev_name=dev_name,
+        ao_x=ao_x,
+        ao_y=ao_y,
+        coord_config_path=coord_config_path,
+        fake_backend=fake_backend,
     )
-    win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y, coord_settings=settings)
     win.resize(900, 420)
     win.show()
     return app, win
@@ -486,6 +429,7 @@ def run(
     ao_x: str = "ao0",
     ao_y: str = "ao1",
     coord_config_path: str | None = None,
+    fake_backend: bool = False,
     *,
     return_app_and_window: bool = False,
     block: bool = True,
@@ -497,11 +441,13 @@ def run(
       - block=True (default) enters the Qt event loop (script-style).
     """
     app = QApplication.instance() or QApplication(sys.argv)
-    settings = load_coordinate_settings(
-        coord_config_path,
-        CoordinateSettings.default_for_channels(ao_x, ao_y),
+    win = _auto_window(
+        dev_name=dev_name,
+        ao_x=ao_x,
+        ao_y=ao_y,
+        coord_config_path=coord_config_path,
+        fake_backend=fake_backend,
     )
-    win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y, coord_settings=settings)
     win.resize(900, 420)
     win.show()
 
