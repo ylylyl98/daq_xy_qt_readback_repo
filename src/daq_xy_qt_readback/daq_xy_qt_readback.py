@@ -22,12 +22,13 @@ Script usage (blocking):
 
 Requires:
 - PyQt6 (pip install PyQt6)
-- Your iv_automation.py providing DaqControl (or a simulator is used automatically).
+- Your iv_automation.py providing DaqControl for a real NI-DAQ device.
 """
 
 from __future__ import annotations
 
 import sys
+import logging
 from dataclasses import dataclass
 from typing import Any, Tuple
 
@@ -39,55 +40,45 @@ from PyQt6.QtWidgets import (
 )
 
 STEP_PER_MOVE = 0.05
+LOGGER = logging.getLogger(__name__)
+
 # ---------------- DAQ backend ----------------
 def _clamp(v: float, lo: float = 0.0, hi: float = 10.0) -> float:
     return max(lo, min(hi, float(v)))
 
-class _SimDaq:
-    """Simulator (no hardware I/O) if iv_automation is unavailable."""
-    def __init__(self, dev_name: str) -> None:
-        self.last = {"x_v": 0.0, "y_v": 0.0}
-        print("[SimDaq] Using simulator (no hardware).")
-
-    def add_ao_channel(self, ch: str, name: str) -> None:
-        print(f"[SimDaq] add_ao_channel({ch!r}, {name!r})")
-
-    def receive_x(self, name: str, value: float) -> None:
-        self.last[name] = float(value)
-
-    def write_x(self) -> None:
-        print(f"[SimDaq] write AO -> x={self.last['x_v']:.3f} V, y={self.last['y_v']:.3f} V")
-
-    def read_y(self) -> dict[str, float]:
-        return self.last
-
-    def send_y(self, name: str) -> float:
-        return float(self.last.get(name.replace("measured_", ""), 0.0))
-
-    @property
-    def ao_task(self):
-        class _T:
-            def close(self_inner): print("[SimDaq] ao_task.close()")
-        return _T()
-
-    @property
-    def ai_task(self):
-        class _T:
-            def close(self_inner): print("[SimDaq] ai_task.close()")
-        return _T()
-
 try:
-    from iv_automation import DaqControl as _RealDaqControl  # your hardware wrapper
-    _DAQ_AVAILABLE = True
-except Exception:
-    _RealDaqControl = _SimDaq  # fallback
-    _DAQ_AVAILABLE = False
+    from iv_automation import DaqControl as _RealDaqControl  # real hardware wrapper
+    _DAQ_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    _RealDaqControl = None
+    _DAQ_IMPORT_ERROR = exc
+
+
+def _next_ramp_point(
+    x: float,
+    y: float,
+    target_x: float,
+    target_y: float,
+    step: float,
+) -> Tuple[float, float]:
+    """Compute one ramp step from current point toward target."""
+    dx = target_x - x
+    dy = target_y - y
+    dist = (dx * dx + dy * dy) ** 0.5
+    if dist <= step:
+        return target_x, target_y
+    return x + (dx / dist) * step, y + (dy / dist) * step
 
 
 class DaqInterface:
     """Thin adapter around the DAQ backend with safe read fallbacks."""
 
     def __init__(self, dev_name: str, ao_x: str, ao_y: str) -> None:
+        if _RealDaqControl is None:
+            raise RuntimeError(
+                "Real DAQ control is unavailable. Ensure iv_automation.py and its "
+                "dependencies (nidaqmx, pyvisa, numpy) are installed."
+            ) from _DAQ_IMPORT_ERROR
         self._daq = _RealDaqControl(dev_name)
         self._name_x, self._name_y = "x_v", "y_v"
         self._x, self._y = 0.0, 0.0
@@ -102,6 +93,7 @@ class DaqInterface:
             my = float(self._daq.send_y('measured_' + self._name_y))
             return _clamp(mx), _clamp(my)
         except Exception:
+            LOGGER.debug("Falling back to last set XY when measured readback fails.", exc_info=True)
             return self._x, self._y
 
     def _receive(self) -> None:
@@ -112,15 +104,21 @@ class DaqInterface:
         self._x, self._y = _clamp(x_v), _clamp(y_v)
         self._receive()
         self._daq.write_x()
-        try: self._daq.read_y()
-        except Exception: pass
+        try:
+            self._daq.read_y()
+        except Exception:
+            LOGGER.debug("DAQ readback failed after write; continuing with setpoints.", exc_info=True)
         return self._x, self._y
 
     def close(self) -> None:
-        try: self._daq.ao_task.close()
-        except Exception: pass
-        try: self._daq.ai_task.close()
-        except Exception: pass
+        try:
+            self._daq.ao_task.close()
+        except Exception:
+            LOGGER.debug("Failed closing AO task.", exc_info=True)
+        try:
+            self._daq.ai_task.close()
+        except Exception:
+            LOGGER.debug("Failed closing AI task.", exc_info=True)
 
 
 # ---------------- XY Pad ----------------
@@ -353,13 +351,7 @@ class DaqXYWindow(QMainWindow):
             return
 
         step = self.ramp.step_v  # 0.1 V fixed
-        # Move along the vector toward target by at most step
-        dist = (dx*dx + dy*dy) ** 0.5
-        if dist <= step:
-            nx, ny = self._target_x, self._target_y
-        else:
-            nx = self._x + (dx / dist) * step
-            ny = self._y + (dy / dist) * step
+        nx, ny = _next_ramp_point(self._x, self._y, self._target_x, self._target_y, step)
 
         self._x, self._y = self._daq.write_xy(_clamp(nx), _clamp(ny))
         self._sync_ui()
