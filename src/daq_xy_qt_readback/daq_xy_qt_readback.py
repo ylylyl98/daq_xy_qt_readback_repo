@@ -1,6 +1,6 @@
 
 """
-daq_xy_qt.py — PyQt6 UI to control NI-DAQ AO0/AO1 (0–10 V)
+daq_xy_qt.py - PyQt6 UI to control NI-DAQ AO0/AO1 (0-10 V)
 with an XY pad, sliders, and nudge buttons.
 
 Safety constraints:
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Tuple
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPainter, QPen
@@ -58,8 +58,11 @@ class _SimDaq:
     def write_x(self) -> None:
         print(f"[SimDaq] write AO -> x={self.last['x_v']:.3f} V, y={self.last['y_v']:.3f} V")
 
-    def read_y(self):
+    def read_y(self) -> dict[str, float]:
         return self.last
+
+    def send_y(self, name: str) -> float:
+        return float(self.last.get(name.replace("measured_", ""), 0.0))
 
     @property
     def ao_task(self):
@@ -82,6 +85,8 @@ except Exception:
 
 
 class DaqInterface:
+    """Thin adapter around the DAQ backend with safe read fallbacks."""
+
     def __init__(self, dev_name: str, ao_x: str, ao_y: str) -> None:
         self._daq = _RealDaqControl(dev_name)
         self._name_x, self._name_y = "x_v", "y_v"
@@ -90,7 +95,7 @@ class DaqInterface:
         self._daq.add_ao_channel(ao_y, self._name_y)
         self._receive()
 
-    def read_measured_xy(self):
+    def read_measured_xy(self) -> Tuple[float, float]:
         try:
             self._daq.read_y()
             mx = float(self._daq.send_y('measured_' + self._name_x))
@@ -99,7 +104,7 @@ class DaqInterface:
         except Exception:
             return self._x, self._y
 
-    def _receive(self):
+    def _receive(self) -> None:
         self._daq.receive_x(self._name_x, self._x)
         self._daq.receive_x(self._name_y, self._y)
 
@@ -111,7 +116,7 @@ class DaqInterface:
         except Exception: pass
         return self._x, self._y
 
-    def close(self):
+    def close(self) -> None:
         try: self._daq.ao_task.close()
         except Exception: pass
         try: self._daq.ai_task.close()
@@ -122,23 +127,23 @@ class DaqInterface:
 class XyPad(QWidget):
     clicked = pyqtSignal(float, float)  # volts (x, y)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumSize(240, 240)
         self._x, self._y = 0.0, 0.0
 
-    def set_xy(self, x_v: float, y_v: float):
+    def set_xy(self, x_v: float, y_v: float) -> None:
         self._x, self._y = _clamp(x_v), _clamp(y_v)
         self.update()
 
-    def mousePressEvent(self, e):  # type: ignore[override]
+    def mousePressEvent(self, e: Any) -> None:  # type: ignore[override]
         self._handle_mouse(e)
 
-    def mouseMoveEvent(self, e):  # type: ignore[override]
+    def mouseMoveEvent(self, e: Any) -> None:  # type: ignore[override]
         if e.buttons() & Qt.MouseButton.LeftButton:
             self._handle_mouse(e)
 
-    def _handle_mouse(self, e):
+    def _handle_mouse(self, e: Any) -> None:
         w = max(1, self.width() - 1)
         h = max(1, self.height() - 1)
         pos = e.position()  # QPointF in PyQt6
@@ -146,7 +151,7 @@ class XyPad(QWidget):
         y_v = _clamp(10.0 * (1.0 - (pos.y() / h)))
         self.clicked.emit(float(x_v), float(y_v))
 
-    def paintEvent(self, _):  # type: ignore[override]
+    def paintEvent(self, _: Any) -> None:  # type: ignore[override]
         p = QPainter(self)
         w, h = self.width(), self.height()
         # Border
@@ -174,9 +179,11 @@ class RampConfig:
     dwell_ms: int = 100      # fixed dwell (ms)
 
 class DaqXYWindow(QMainWindow):
-    def __init__(self, dev_name="Dev1", ao_x="ao0", ao_y="ao1"):
+    """Main UI window with ramped XY output controls."""
+
+    def __init__(self, dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> None:
         super().__init__()
-        self.setWindowTitle(f"NI-DAQ XY Control (AO0/AO1) — Ramped {STEP_PER_MOVE}V @ 100ms")
+        self.setWindowTitle(f"NI-DAQ XY Control (AO0/AO1) - Ramped {STEP_PER_MOVE}V @ 100ms")
         self._enabled = False
         self._daq = DaqInterface(dev_name, ao_x, ao_y)
         mx, my = self._daq.read_measured_xy()
@@ -192,7 +199,7 @@ class DaqXYWindow(QMainWindow):
         self._sync_ui()
 
     # ---- UI construction ----
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         cw = QWidget()
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
@@ -229,12 +236,12 @@ class DaqXYWindow(QMainWindow):
         center.addWidget(sliders_box, 3)
 
         # Nudge (fixed 0.1 V)
-        right_box = QGroupBox(f"Nudge (±{STEP_PER_MOVE} V each)")
+        right_box = QGroupBox(f"Nudge (+/-{STEP_PER_MOVE} V each)")
         rgrid = QGridLayout(right_box)
-        self.btn_left  = QPushButton("◀")
-        self.btn_right = QPushButton("▶")
-        self.btn_up    = QPushButton("▲")
-        self.btn_down  = QPushButton("▼")
+        self.btn_left  = QPushButton("Left")
+        self.btn_right = QPushButton("Right")
+        self.btn_up    = QPushButton("Up")
+        self.btn_down  = QPushButton("Down")
 
         rgrid.addWidget(self.btn_up,          0, 1)
         rgrid.addWidget(self.btn_left,        1, 0)
@@ -264,12 +271,12 @@ class DaqXYWindow(QMainWindow):
         self.btn_up.clicked.connect(lambda: self._nudge( 0.0,  +STEP_PER_MOVE))
         self.btn_down.clicked.connect(lambda: self._nudge( 0.0,  -STEP_PER_MOVE))
 
-    def _hbox(self, *widgets):
+    def _hbox(self, *widgets: QWidget) -> QWidget:
         w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(0,0,0,0)
         for x in widgets: l.addWidget(x)
         return w
 
-    def _sync_ui(self):
+    def _sync_ui(self) -> None:
         # sync drivers & widgets
         self.pad.set_xy(self._x, self._y)
         self.sld_x.blockSignals(True); self.sld_y.blockSignals(True)
@@ -282,28 +289,28 @@ class DaqXYWindow(QMainWindow):
         self.spn_x.blockSignals(False); self.spn_y.blockSignals(False)
         self._update_status()
 
-    def _update_status(self):
+    def _update_status(self) -> None:
         en = "ON" if self._enabled else "OFF"
         self.lbl_status.setText(f"Output {en} | X={self._x:.3f} V | Y={self._y:.3f} V (ramp {STEP_PER_MOVE}V/100ms)")
 
     # ---- Actions ----
-    def _on_enable_toggled(self, checked: bool):
+    def _on_enable_toggled(self, checked: bool) -> None:
         self._enabled = bool(checked)
         # No forced zeroing on disable (to avoid sudden jumps)
         if not self._enabled:
             self._ramp_timer.stop()
         self._update_status()
 
-    def _on_slider_spin_changed(self, axis: str, value: float):
+    def _on_slider_spin_changed(self, axis: str, value: float) -> None:
         if axis == 'x':
             self.set_target_volts(value, self._target_y)
         else:
             self.set_target_volts(self._target_x, value)
 
-    def _nudge(self, dx: float, dy: float):
+    def _nudge(self, dx: float, dy: float) -> None:
         self.set_target_volts(self._target_x + dx, self._target_y + dy)
 
-    def set_target_volts(self, x_v: float, y_v: float):
+    def set_target_volts(self, x_v: float, y_v: float) -> None:
         x_v = _clamp(x_v); y_v = _clamp(y_v)
         self._target_x, self._target_y = x_v, y_v
         # reflect targets in UI immediately
@@ -320,7 +327,7 @@ class DaqXYWindow(QMainWindow):
         if self._enabled:
             self._start_ramp()
 
-    def ground(self):
+    def ground(self) -> None:
         """Ramp both channels to 0 V using fixed ramp parameters."""
         if not self._enabled:
             # Turn on output so the ramp can proceed safely.
@@ -328,13 +335,13 @@ class DaqXYWindow(QMainWindow):
         self.set_target_volts(0.0, 0.0)
 
     # ---- ramping (fixed 0.1 V / 50 ms) ----
-    def _start_ramp(self):
+    def _start_ramp(self) -> None:
         if self.ramp.dwell_ms <= 0:
             self.ramp.dwell_ms = 50
         if not self._ramp_timer.isActive():
             self._ramp_timer.start(self.ramp.dwell_ms)
 
-    def _ramp_step(self):
+    def _ramp_step(self) -> None:
         if not self._enabled:
             self._ramp_timer.stop()
             return
@@ -355,11 +362,10 @@ class DaqXYWindow(QMainWindow):
             ny = self._y + (dy / dist) * step
 
         self._x, self._y = self._daq.write_xy(_clamp(nx), _clamp(ny))
-        self.pad.set_xy(self._x, self._y)
         self._sync_ui()
 
     # Clean close
-    def closeEvent(self, e):  # type: ignore[override]
+    def closeEvent(self, e: Any) -> None:  # type: ignore[override]
         try:
             self._ramp_timer.stop()
             self._daq.close()
@@ -368,7 +374,7 @@ class DaqXYWindow(QMainWindow):
 
 
 # ---------------- Launchers ----------------
-def _ensure_qt_in_notebook():
+def _ensure_qt_in_notebook() -> None:
     """Enable IPython Qt integration if running in a notebook/console."""
     try:
         from IPython import get_ipython
@@ -379,7 +385,7 @@ def _ensure_qt_in_notebook():
         pass
 
 
-def _auto_window(dev_name="Dev1", ao_x="ao0", ao_y="ao1"):
+def _auto_window(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> DaqXYWindow:
     # Try Dev1 then Dev2 if first attempt fails
     try:
         return DaqXYWindow(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y)
@@ -392,7 +398,7 @@ def _auto_window(dev_name="Dev1", ao_x="ao0", ao_y="ao1"):
         raise
 
 
-def launch(dev_name="Dev1", ao_x="ao0", ao_y="ao1"):
+def launch(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> Tuple[QApplication, DaqXYWindow]:
     """Non-blocking launcher ideal for notebooks. Returns (app, window)."""
     app = QApplication.instance() or QApplication(sys.argv)
     _ensure_qt_in_notebook()
@@ -401,7 +407,14 @@ def launch(dev_name="Dev1", ao_x="ao0", ao_y="ao1"):
     win.show()
     return app, win
 
-def run(dev_name="Dev1", ao_x="ao0", ao_y="ao1", *, return_app_and_window=False, block=True):
+def run(
+    dev_name: str = "Dev1",
+    ao_x: str = "ao0",
+    ao_y: str = "ao1",
+    *,
+    return_app_and_window: bool = False,
+    block: bool = True,
+) -> Tuple[QApplication, DaqXYWindow] | None:
     """
     General launcher.
       - return_app_and_window=True returns (app, win) and does not call exec.
@@ -424,3 +437,5 @@ def run(dev_name="Dev1", ao_x="ao0", ao_y="ao1", *, return_app_and_window=False,
 
 if __name__ == "__main__":
     run()
+
+
