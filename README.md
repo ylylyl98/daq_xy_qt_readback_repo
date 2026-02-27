@@ -21,6 +21,7 @@ Optional arguments:
 
 ```bat
 Start_DAQ_XY_UI.bat Dev1 ao0 ao1
+Start_DAQ_XY_UI.bat Dev1 ao0 ao1 coord_config.json
 ```
 
 ### Manual run (from repo root)
@@ -31,6 +32,7 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 $env:PYTHONPATH="src"
 python -m daq_xy_qt_readback --dev Dev1 --ao-x ao0 --ao-y ao1
+python -m daq_xy_qt_readback --dev Dev1 --ao-x ao0 --ao-y ao1 --coord-config coord_config.json
 ```
 
 ### Editable install path
@@ -67,6 +69,36 @@ daq_xy_qt_readback_repo/
 
 For real hardware I/O, `iv_automation.py` must be importable in the same environment.
 If unavailable, app startup fails with a clear error.
+
+## Coordinate transform config (mapping + polarity + rotation)
+
+Default behavior is backward compatible:
+- rotation = `0`
+- `axis_map.u=ao0`, `axis_map.v=ao1`
+- `axis_polarity` normal for both axes
+- range `0..10`
+- out-of-range mode `clamp`
+
+Optional JSON file:
+
+```json
+{
+  "axis_map": { "u": "ao1", "v": "ao0" },
+  "axis_polarity": { "u": "inverted", "v": "normal" },
+  "voltage_range": { "min": 0.0, "max": 10.0 },
+  "transform": {
+    "rotation_deg": 90.0,
+    "rotate_about": "origin",
+    "offset_uv": [0.0, 0.0]
+  },
+  "on_out_of_range": "error"
+}
+```
+
+Notes:
+- Pipeline is centralized and applied to all manual scanner moves:
+  logical `(x,y)` -> physical `(u,v)` -> AO channel voltages.
+- `rotate_about` supports `origin` or `center` (center = midpoint of configured voltage range).
 
 ## Troubleshooting
 

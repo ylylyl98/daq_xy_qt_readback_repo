@@ -38,6 +38,14 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QSlider, QDoubleSpinBox, QGroupBox, QFormLayout, QCheckBox
 )
+from .coordinate_transform import (
+    CoordinateSettings,
+    ao_volts_to_physical_uv,
+    load_coordinate_settings,
+    logical_xy_to_physical_uv,
+    physical_uv_to_ao_volts,
+    physical_uv_to_logical_xy,
+)
 
 STEP_PER_MOVE = 0.05
 LOGGER = logging.getLogger(__name__)
@@ -73,35 +81,66 @@ def _next_ramp_point(
 class DaqInterface:
     """Thin adapter around the DAQ backend with safe read fallbacks."""
 
-    def __init__(self, dev_name: str, ao_x: str, ao_y: str) -> None:
+    def __init__(
+        self,
+        dev_name: str,
+        ao_x: str,
+        ao_y: str,
+        coord_settings: CoordinateSettings | None = None,
+    ) -> None:
         if _RealDaqControl is None:
             raise RuntimeError(
                 "Real DAQ control is unavailable. Ensure iv_automation.py and its "
                 "dependencies (nidaqmx, pyvisa, numpy) are installed."
             ) from _DAQ_IMPORT_ERROR
+        self.settings = coord_settings or CoordinateSettings.default_for_channels(ao_x, ao_y)
+        self.settings.validate()
         self._daq = _RealDaqControl(dev_name)
-        self._name_x, self._name_y = "x_v", "y_v"
-        self._x, self._y = 0.0, 0.0
-        self._daq.add_ao_channel(ao_x, self._name_x)
-        self._daq.add_ao_channel(ao_y, self._name_y)
+        configured_channels = {ao_x, ao_y}
+        mapped_channels = {self.settings.axis_map.u, self.settings.axis_map.v}
+        if mapped_channels != configured_channels:
+            raise ValueError(
+                "axis_map must use exactly the configured channels "
+                f"{sorted(configured_channels)}, got {sorted(mapped_channels)}"
+            )
+        self._channel_to_var = {
+            ao_x: "ch0_v",
+            ao_y: "ch1_v",
+        }
+        self._x, self._y = self.settings.voltage_range.min_v, self.settings.voltage_range.min_v
+        self._daq.add_ao_channel(ao_x, self._channel_to_var[ao_x])
+        self._daq.add_ao_channel(ao_y, self._channel_to_var[ao_y])
         self._receive()
 
     def read_measured_xy(self) -> Tuple[float, float]:
         try:
             self._daq.read_y()
-            mx = float(self._daq.send_y('measured_' + self._name_x))
-            my = float(self._daq.send_y('measured_' + self._name_y))
-            return _clamp(mx), _clamp(my)
+            measured_ao = {
+                ch: float(self._daq.send_y("measured_" + var_name))
+                for ch, var_name in self._channel_to_var.items()
+            }
+            u, v = ao_volts_to_physical_uv(measured_ao, self.settings)
+            x, y = physical_uv_to_logical_xy(u, v, self.settings)
+            return _clamp(x), _clamp(y)
         except Exception:
             LOGGER.debug("Falling back to last set XY when measured readback fails.", exc_info=True)
             return self._x, self._y
 
     def _receive(self) -> None:
-        self._daq.receive_x(self._name_x, self._x)
-        self._daq.receive_x(self._name_y, self._y)
+        u, v = logical_xy_to_physical_uv(self._x, self._y, self.settings)
+        ao_volts, clamped = physical_uv_to_ao_volts(u, v, self.settings)
+        if clamped:
+            LOGGER.warning(
+                "Coordinate command was clamped to voltage range [%s, %s].",
+                self.settings.voltage_range.min_v,
+                self.settings.voltage_range.max_v,
+            )
+        for channel, var_name in self._channel_to_var.items():
+            self._daq.receive_x(var_name, ao_volts[channel])
 
     def write_xy(self, x_v: float, y_v: float) -> Tuple[float, float]:
-        self._x, self._y = _clamp(x_v), _clamp(y_v)
+        self._x = _clamp(x_v, self.settings.voltage_range.min_v, self.settings.voltage_range.max_v)
+        self._y = _clamp(y_v, self.settings.voltage_range.min_v, self.settings.voltage_range.max_v)
         self._receive()
         self._daq.write_x()
         try:
@@ -128,10 +167,19 @@ class XyPad(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumSize(240, 240)
+        self._vmin = 0.0
+        self._vmax = 10.0
         self._x, self._y = 0.0, 0.0
 
+    def set_voltage_range(self, vmin: float, vmax: float) -> None:
+        self._vmin = float(vmin)
+        self._vmax = float(vmax)
+        self._x = _clamp(self._x, self._vmin, self._vmax)
+        self._y = _clamp(self._y, self._vmin, self._vmax)
+        self.update()
+
     def set_xy(self, x_v: float, y_v: float) -> None:
-        self._x, self._y = _clamp(x_v), _clamp(y_v)
+        self._x, self._y = _clamp(x_v, self._vmin, self._vmax), _clamp(y_v, self._vmin, self._vmax)
         self.update()
 
     def mousePressEvent(self, e: Any) -> None:  # type: ignore[override]
@@ -144,9 +192,10 @@ class XyPad(QWidget):
     def _handle_mouse(self, e: Any) -> None:
         w = max(1, self.width() - 1)
         h = max(1, self.height() - 1)
+        span = max(1e-9, self._vmax - self._vmin)
         pos = e.position()  # QPointF in PyQt6
-        x_v = _clamp(10.0 * (pos.x() / w))
-        y_v = _clamp(10.0 * (1.0 - (pos.y() / h)))
+        x_v = _clamp(self._vmin + span * (pos.x() / w), self._vmin, self._vmax)
+        y_v = _clamp(self._vmin + span * (1.0 - (pos.y() / h)), self._vmin, self._vmax)
         self.clicked.emit(float(x_v), float(y_v))
 
     def paintEvent(self, _: Any) -> None:  # type: ignore[override]
@@ -164,8 +213,9 @@ class XyPad(QWidget):
             p.drawLine(xi, 0, xi, h)
             p.drawLine(0, yi, w, yi)
         # Crosshair at current XY
-        cx = int((self._x / 10.0) * (w-1))
-        cy = int((1.0 - self._y / 10.0) * (h-1))
+        span = max(1e-9, self._vmax - self._vmin)
+        cx = int(((self._x - self._vmin) / span) * (w - 1))
+        cy = int((1.0 - ((self._y - self._vmin) / span)) * (h - 1))
         p.drawLine(cx-6, cy, cx+6, cy)
         p.drawLine(cx, cy-6, cx, cy+6)
 
@@ -179,11 +229,19 @@ class RampConfig:
 class DaqXYWindow(QMainWindow):
     """Main UI window with ramped XY output controls."""
 
-    def __init__(self, dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> None:
+    def __init__(
+        self,
+        dev_name: str = "Dev1",
+        ao_x: str = "ao0",
+        ao_y: str = "ao1",
+        coord_settings: CoordinateSettings | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle(f"NI-DAQ XY Control (AO0/AO1) - Ramped {STEP_PER_MOVE}V @ 100ms")
         self._enabled = False
-        self._daq = DaqInterface(dev_name, ao_x, ao_y)
+        self._daq = DaqInterface(dev_name, ao_x, ao_y, coord_settings=coord_settings)
+        self._vmin = self._daq.settings.voltage_range.min_v
+        self._vmax = self._daq.settings.voltage_range.max_v
         mx, my = self._daq.read_measured_xy()
         self._x = mx
         self._y = my
@@ -217,6 +275,7 @@ class DaqXYWindow(QMainWindow):
         center = QHBoxLayout()
         # XY pad
         self.pad = XyPad()
+        self.pad.set_voltage_range(self._vmin, self._vmax)
         center.addWidget(self.pad, 2)
 
         # Sliders + spins
@@ -225,8 +284,8 @@ class DaqXYWindow(QMainWindow):
 
         self.sld_x = QSlider(Qt.Orientation.Horizontal); self.sld_x.setRange(0, 1000)
         self.sld_y = QSlider(Qt.Orientation.Horizontal); self.sld_y.setRange(0, 1000)
-        self.spn_x = QDoubleSpinBox(); self.spn_x.setRange(0.0, 10.0); self.spn_x.setDecimals(3); self.spn_x.setSingleStep(STEP_PER_MOVE)
-        self.spn_y = QDoubleSpinBox(); self.spn_y.setRange(0.0, 10.0); self.spn_y.setDecimals(3); self.spn_y.setSingleStep(STEP_PER_MOVE)
+        self.spn_x = QDoubleSpinBox(); self.spn_x.setRange(self._vmin, self._vmax); self.spn_x.setDecimals(3); self.spn_x.setSingleStep(STEP_PER_MOVE)
+        self.spn_y = QDoubleSpinBox(); self.spn_y.setRange(self._vmin, self._vmax); self.spn_y.setDecimals(3); self.spn_y.setSingleStep(STEP_PER_MOVE)
 
         fl.addRow(QLabel("X (V)"), self._hbox(self.sld_x, self.spn_x))
         fl.addRow(QLabel("Y (V)"), self._hbox(self.sld_y, self.spn_y))
@@ -259,8 +318,8 @@ class DaqXYWindow(QMainWindow):
         self.btn_ground.clicked.connect(self.ground)
         self.pad.clicked.connect(lambda xv, yv: self.set_target_volts(xv, yv))
 
-        self.sld_x.valueChanged.connect(lambda v: self._on_slider_spin_changed('x', v/100.0))
-        self.sld_y.valueChanged.connect(lambda v: self._on_slider_spin_changed('y', v/100.0))
+        self.sld_x.valueChanged.connect(lambda v: self._on_slider_spin_changed('x', self._slider_to_volts(v)))
+        self.sld_y.valueChanged.connect(lambda v: self._on_slider_spin_changed('y', self._slider_to_volts(v)))
         self.spn_x.valueChanged.connect(lambda v: self._on_slider_spin_changed('x', v))
         self.spn_y.valueChanged.connect(lambda v: self._on_slider_spin_changed('y', v))
 
@@ -274,13 +333,22 @@ class DaqXYWindow(QMainWindow):
         for x in widgets: l.addWidget(x)
         return w
 
+    def _slider_to_volts(self, slider_value: int) -> float:
+        return self._vmin + (float(slider_value) / 1000.0) * (self._vmax - self._vmin)
+
+    def _volts_to_slider(self, volts: float) -> int:
+        if self._vmax <= self._vmin:
+            return 0
+        ratio = (volts - self._vmin) / (self._vmax - self._vmin)
+        return int(round(max(0.0, min(1.0, ratio)) * 1000.0))
+
     def _sync_ui(self) -> None:
         # sync drivers & widgets
         self.pad.set_xy(self._x, self._y)
         self.sld_x.blockSignals(True); self.sld_y.blockSignals(True)
         self.spn_x.blockSignals(True); self.spn_y.blockSignals(True)
-        self.sld_x.setValue(int(round(self._x * 100)))
-        self.sld_y.setValue(int(round(self._y * 100)))
+        self.sld_x.setValue(self._volts_to_slider(self._x))
+        self.sld_y.setValue(self._volts_to_slider(self._y))
         self.spn_x.setValue(self._x)
         self.spn_y.setValue(self._y)
         self.sld_x.blockSignals(False); self.sld_y.blockSignals(False)
@@ -309,14 +377,14 @@ class DaqXYWindow(QMainWindow):
         self.set_target_volts(self._target_x + dx, self._target_y + dy)
 
     def set_target_volts(self, x_v: float, y_v: float) -> None:
-        x_v = _clamp(x_v); y_v = _clamp(y_v)
+        x_v = _clamp(x_v, self._vmin, self._vmax); y_v = _clamp(y_v, self._vmin, self._vmax)
         self._target_x, self._target_y = x_v, y_v
         # reflect targets in UI immediately
         self.pad.set_xy(x_v, y_v)
         self.sld_x.blockSignals(True); self.sld_y.blockSignals(True)
         self.spn_x.blockSignals(True); self.spn_y.blockSignals(True)
-        self.sld_x.setValue(int(round(x_v * 100)))
-        self.sld_y.setValue(int(round(y_v * 100)))
+        self.sld_x.setValue(self._volts_to_slider(x_v))
+        self.sld_y.setValue(self._volts_to_slider(y_v))
         self.spn_x.setValue(x_v)
         self.spn_y.setValue(y_v)
         self.sld_x.blockSignals(False); self.sld_y.blockSignals(False)
@@ -377,24 +445,38 @@ def _ensure_qt_in_notebook() -> None:
         pass
 
 
-def _auto_window(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> DaqXYWindow:
+def _auto_window(
+    dev_name: str = "Dev1",
+    ao_x: str = "ao0",
+    ao_y: str = "ao1",
+    coord_settings: CoordinateSettings | None = None,
+) -> DaqXYWindow:
     # Try Dev1 then Dev2 if first attempt fails
     try:
-        return DaqXYWindow(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y)
+        return DaqXYWindow(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y, coord_settings=coord_settings)
     except Exception as e1:
         if dev_name.lower() == "dev1":
             try:
-                return DaqXYWindow(dev_name="Dev2", ao_x=ao_x, ao_y=ao_y)
+                return DaqXYWindow(dev_name="Dev2", ao_x=ao_x, ao_y=ao_y, coord_settings=coord_settings)
             except Exception:
                 raise e1
         raise
 
 
-def launch(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> Tuple[QApplication, DaqXYWindow]:
+def launch(
+    dev_name: str = "Dev1",
+    ao_x: str = "ao0",
+    ao_y: str = "ao1",
+    coord_config_path: str | None = None,
+) -> Tuple[QApplication, DaqXYWindow]:
     """Non-blocking launcher ideal for notebooks. Returns (app, window)."""
     app = QApplication.instance() or QApplication(sys.argv)
     _ensure_qt_in_notebook()
-    win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y)
+    settings = load_coordinate_settings(
+        coord_config_path,
+        CoordinateSettings.default_for_channels(ao_x, ao_y),
+    )
+    win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y, coord_settings=settings)
     win.resize(900, 420)
     win.show()
     return app, win
@@ -403,6 +485,7 @@ def run(
     dev_name: str = "Dev1",
     ao_x: str = "ao0",
     ao_y: str = "ao1",
+    coord_config_path: str | None = None,
     *,
     return_app_and_window: bool = False,
     block: bool = True,
@@ -414,7 +497,11 @@ def run(
       - block=True (default) enters the Qt event loop (script-style).
     """
     app = QApplication.instance() or QApplication(sys.argv)
-    win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y)
+    settings = load_coordinate_settings(
+        coord_config_path,
+        CoordinateSettings.default_for_channels(ao_x, ao_y),
+    )
+    win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y, coord_settings=settings)
     win.resize(900, 420)
     win.show()
 

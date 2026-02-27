@@ -1,6 +1,13 @@
-import numpy as np, nidaqmx, time, pyvisa
+import numpy as np
+import nidaqmx
+import time
 import warnings
-from typing import Union
+from typing import Any, Union
+
+try:
+    import pyvisa
+except Exception:
+    pyvisa = None
 # connect to the instrument via pyvisa
 
 
@@ -11,7 +18,7 @@ class CustomError(Exception):
 
 
 class PyvisaInstrument:
-    def __init__(self, address: str, name: str, termination: str, rm: pyvisa.ResourceManager):
+    def __init__(self, address: str, name: str, termination: str, rm: Any):
         # instrument address
         self.address = address
         self.name = name
@@ -63,7 +70,9 @@ class PyvisaInstrument:
 
 # monochromator control
 class MonoControl(PyvisaInstrument):
-    def __init__(self, address: str, name: str, rm: pyvisa.ResourceManager, initial_wl: float):
+    def __init__(self, address: str, name: str, rm: Any, initial_wl: float):
+        if pyvisa is None:
+            raise ImportError("pyvisa is required for MonoControl")
         super().__init__(address, name, '\r', rm)
         self.type = 'mono'
         self.connect()
@@ -108,7 +117,9 @@ class MonoControl(PyvisaInstrument):
 
 
 class KeithControl(PyvisaInstrument):
-    def __init__(self, address: str, name: str, variable_name: str, rm: pyvisa.ResourceManager):
+    def __init__(self, address: str, name: str, variable_name: str, rm: Any):
+        if pyvisa is None:
+            raise ImportError("pyvisa is required for KeithControl")
         super().__init__(address, name, '\n', rm)
         self.type = 'keithley'
         self.connect()
@@ -200,7 +211,7 @@ class KeithControl(PyvisaInstrument):
 
     def read_numpy(self, dimension: int):
         raw_data = self.read()
-        result = np.array(raw_data.split(',')).astype(np.float).reshape(dimension, -1)
+        result = np.array(raw_data.split(',')).astype(float).reshape(dimension, -1)
         return result
 
     def write_x(self):
@@ -253,7 +264,7 @@ class DaqControl:
     def read_y(self):
         self.y_values = np.array(self.ai_task.read()).reshape(-1)
 
-    def send_y(self, variable: float):
+    def send_y(self, variable: str):
         return self.y_values[self.y_indexes[variable]]
 
     def check_status(self):
@@ -550,7 +561,9 @@ class OneDSweep:
             self.trigger()
 
 class MagnetPowerSupplyControl(PyvisaInstrument):
-    def __init__(self, address: str, name: str, termination: str, rm: pyvisa.ResourceManager):
+    def __init__(self, address: str, name: str, termination: str, rm: Any):
+        if pyvisa is None:
+            raise ImportError("pyvisa is required for MagnetPowerSupplyControl")
         super().__init__(address, name, termination, rm)
         self.type = 'attodry1000'
         self.delay = 0.4
