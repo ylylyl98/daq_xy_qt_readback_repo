@@ -13,11 +13,11 @@ def main() -> int:
 
     import daq_xy_qt_readback
     from daq_xy_qt_readback import __main__ as cli
-    from daq_xy_qt_readback.coordinate_transform import CoordinateSettings
+    from daq_xy_qt_readback.daq_xy_qt_readback import DaqInterface
 
     assert callable(daq_xy_qt_readback.run)
     assert callable(daq_xy_qt_readback.launch)
-    assert CoordinateSettings is not None
+    assert DaqInterface is not None
 
     try:
         cli.main(["--help"])

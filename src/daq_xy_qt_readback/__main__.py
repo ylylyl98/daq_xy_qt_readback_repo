@@ -20,20 +20,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Optional JSON config path for axis map/polarity/rotation settings.",
     )
-    p.add_argument(
-        "--fake-backend",
-        action="store_true",
-        help="Use fake controller backend (for tests/debug, no hardware).",
-    )
     args = p.parse_args(argv)
     try:
-        run(
-            args.dev,
-            args.ao_x,
-            args.ao_y,
-            coord_config_path=args.coord_config,
-            fake_backend=bool(args.fake_backend),
-        )
+        run(args.dev, args.ao_x, args.ao_y, coord_config_path=args.coord_config)
     except Exception as exc:
         print(f"Failed to launch DAQ XY UI: {exc}", file=sys.stderr)
         return 1
