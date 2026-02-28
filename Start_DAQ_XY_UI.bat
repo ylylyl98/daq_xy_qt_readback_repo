@@ -4,15 +4,14 @@ setlocal enabledelayedexpansion
 
 REM --------- DAQ XY UI one-click launcher (Windows) ----------
 REM Usage (optional):
-REM   Start_DAQ_XY_UI.bat Dev1 ao0 ao1 path\to\coord_config.json
-REM Defaults: Dev1 ao0 ao1 (no coordinate config)
+REM   Start_DAQ_XY_UI.bat Dev1 ao0 ao1
+REM Defaults: Dev1 ao0 ao1
 
 cd /d "%~dp0"
 
 set DEV=%1
 set AOX=%2
 set AOY=%3
-set COORDCFG=%4
 if "%DEV%"=="" set DEV=Dev1
 if "%AOX%"=="" set AOX=ao0
 if "%AOY%"=="" set AOY=ao1
@@ -38,11 +37,7 @@ python -m pip install --upgrade pip >nul
 pip install -r requirements.txt
 
 echo [3/3] Launching DAQ XY UI (dev=%DEV% ao-x=%AOX% ao-y=%AOY%) ...
-if "%COORDCFG%"=="" (
-  python -m daq_xy_qt_readback --dev "%DEV%" --ao-x "%AOX%" --ao-y "%AOY%"
-) else (
-  python -m daq_xy_qt_readback --dev "%DEV%" --ao-x "%AOX%" --ao-y "%AOY%" --coord-config "%COORDCFG%"
-)
+python -m daq_xy_qt_readback --dev "%DEV%" --ao-x "%AOX%" --ao-y "%AOY%"
 
 echo.
 echo UI closed. Press any key to exit.

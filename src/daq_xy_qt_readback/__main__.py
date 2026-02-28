@@ -15,14 +15,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--dev", default="Dev1", help="NI device name (default: Dev1)")
     p.add_argument("--ao-x", default="ao0", help="AO channel for X (default: ao0)")
     p.add_argument("--ao-y", default="ao1", help="AO channel for Y (default: ao1)")
-    p.add_argument(
-        "--coord-config",
-        default=None,
-        help="Optional JSON config path for axis map/polarity/rotation settings.",
-    )
     args = p.parse_args(argv)
     try:
-        run(args.dev, args.ao_x, args.ao_y, coord_config_path=args.coord_config)
+        run(args.dev, args.ao_x, args.ao_y)
     except Exception as exc:
         print(f"Failed to launch DAQ XY UI: {exc}", file=sys.stderr)
         return 1
