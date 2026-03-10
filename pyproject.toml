@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "PyQt6 XY-pad UI for NI-DAQ AO control with ramping and optional readback."
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["PyQt6>=6.5"]
+dependencies = [
+    "PyQt6>=6.5",
+    "numpy",
+    "nidaqmx",
+    "pyvisa",
+]
 
 [project.scripts]
 daq-xy-ui = "daq_xy_qt_readback.__main__:main"

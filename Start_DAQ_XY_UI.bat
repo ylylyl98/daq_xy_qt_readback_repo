@@ -1,4 +1,3 @@
-\
 @echo off
 setlocal enabledelayedexpansion
 
@@ -33,11 +32,12 @@ REM Activate venv
 call ".venv\Scripts\activate.bat"
 
 echo [2/3] Installing/upgrading dependencies...
-python -m pip install --upgrade pip >nul
-pip install -r requirements.txt
+".venv\Scripts\python.exe" -m pip install --upgrade pip >nul
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
+".venv\Scripts\python.exe" -m pip install -e .
 
 echo [3/3] Launching DAQ XY UI (dev=%DEV% ao-x=%AOX% ao-y=%AOY%) ...
-python -m daq_xy_qt_readback --dev "%DEV%" --ao-x "%AOX%" --ao-y "%AOY%"
+".venv\Scripts\python.exe" -m daq_xy_qt_readback --dev "%DEV%" --ao-x "%AOX%" --ao-y "%AOY%"
 
 echo.
 echo UI closed. Press any key to exit.
