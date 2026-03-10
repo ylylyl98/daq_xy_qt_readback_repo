@@ -7,6 +7,9 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 - Uses `iv_automation.DaqControl` with a real NI-DAQ device (no simulator fallback).
 
 ## Run the app
+```bat
+git clone https://github.com/ylylyl98/daq_xy_qt_readback_repo.git
+```
 
 ### Windows one-click launcher
 
