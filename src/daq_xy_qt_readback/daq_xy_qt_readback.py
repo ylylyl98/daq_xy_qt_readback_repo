@@ -174,7 +174,7 @@ def _detect_devices_and_channels() -> tuple[list[str], dict[str, list[str]], str
 
 
 class DaqInterface:
-    """Real NI-DAQ write/read wrapper using selected AO channels."""
+    """Real NI-DAQ wrapper that preserves live AO state until an explicit move."""
 
     def __init__(self, dev_name: str, ao_x: str, ao_y: str) -> None:
         if _RealDaqControl is None:
@@ -190,33 +190,134 @@ class DaqInterface:
         self._name_y = "y_v"
         self._vx = 0.0
         self._vy = 0.0
-        self._daq.add_ao_channel(ao_x, self._name_x)
-        self._daq.add_ao_channel(ao_y, self._name_y)
-        self._receive()
+        self._readback_uncertain = False
+        self._readback_status = "AO state not read yet."
+        self._readback_warning_logged = False
+        try:
+            self._daq.add_ao_channel(ao_x, self._name_x)
+            self._daq.add_ao_channel(ao_y, self._name_y)
+            self._vx, self._vy = self._preserve_existing_outputs_on_connect()
+            self._cache_outputs_without_writing(self._vx, self._vy)
+        except Exception:
+            self.close()
+            raise
 
-    def _receive(self) -> None:
+    @property
+    def readback_uncertain(self) -> bool:
+        return bool(self._readback_uncertain)
+
+    @property
+    def readback_status(self) -> str:
+        return str(self._readback_status)
+
+    def _cache_outputs_without_writing(self, vx: float, vy: float) -> None:
+        # Keep the driver-side command cache aligned with the preserved live outputs,
+        # but do not issue any AO write during startup/shutdown/reconnect.
+        self._vx = clamp_voltage(vx)
+        self._vy = clamp_voltage(vy)
         self._daq.receive_x(self._name_x, self._vx)
         self._daq.receive_x(self._name_y, self._vy)
 
+    def _read_backend_cached_outputs(self) -> tuple[float, float] | None:
+        try:
+            x_vals = getattr(self._daq, "x_values", None)
+            x_indexes = getattr(self._daq, "x_indexes", {})
+            if x_vals is None:
+                return None
+            vx = float(x_vals[x_indexes[self._name_x]])
+            vy = float(x_vals[x_indexes[self._name_y]])
+            return clamp_voltage(vx), clamp_voltage(vy)
+        except Exception:
+            return None
+
+    def _read_hardware_outputs(self) -> tuple[float, float]:
+        self._daq.read_y()
+        mx = float(self._daq.send_y("measured_" + self._name_x))
+        my = float(self._daq.send_y("measured_" + self._name_y))
+        return clamp_voltage(mx), clamp_voltage(my)
+
+    def _preserve_existing_outputs_on_connect(self) -> tuple[float, float]:
+        try:
+            vx, vy = self._read_hardware_outputs()
+            self._readback_uncertain = False
+            self._readback_status = "Preserved existing scanner AO outputs from hardware readback."
+            LOGGER.info(
+                "Preserved existing scanner AO outputs on connect for %s (%s,%s): %.4f V, %.4f V",
+                self.dev_name,
+                self.ao_x,
+                self.ao_y,
+                vx,
+                vy,
+            )
+            return vx, vy
+        except Exception as exc:
+            cached = self._read_backend_cached_outputs()
+            if cached is not None:
+                vx, vy = cached
+                self._readback_uncertain = True
+                self._readback_status = (
+                    "Hardware AO readback is unavailable; preserving the last known driver cache. "
+                    "No startup write was issued."
+                )
+                LOGGER.warning(
+                    "AO readback unavailable while connecting to %s (%s,%s); preserving cached outputs %.4f V, %.4f V without writing (%s).",
+                    self.dev_name,
+                    self.ao_x,
+                    self.ao_y,
+                    vx,
+                    vy,
+                    exc,
+                )
+                self._readback_warning_logged = True
+                return vx, vy
+            raise RuntimeError(
+                f"Unable to determine existing scanner AO outputs for {self.dev_name} "
+                f"({self.ao_x},{self.ao_y}) safely. No startup write was issued."
+            ) from exc
+
     def read_outputs(self) -> tuple[float, float]:
         try:
-            self._daq.read_y()
-            mx = float(self._daq.send_y("measured_" + self._name_x))
-            my = float(self._daq.send_y("measured_" + self._name_y))
-            self._vx = clamp_voltage(mx)
-            self._vy = clamp_voltage(my)
-        except Exception:
-            LOGGER.debug("Readback failed; using cached outputs.", exc_info=True)
+            self._vx, self._vy = self._read_hardware_outputs()
+            self._readback_uncertain = False
+            self._readback_status = "Showing live hardware AO readback."
+            self._readback_warning_logged = False
+        except Exception as exc:
+            cached = self._read_backend_cached_outputs()
+            if cached is not None:
+                self._vx, self._vy = cached
+            self._cache_outputs_without_writing(self._vx, self._vy)
+            self._readback_uncertain = True
+            self._readback_status = (
+                "Hardware AO readback is unavailable; showing the last preserved output values. "
+                "No automatic AO write was issued."
+            )
+            if not self._readback_warning_logged:
+                LOGGER.warning(
+                    "Hardware AO readback unavailable for %s (%s,%s); preserving last known outputs %.4f V, %.4f V without writing (%s).",
+                    self.dev_name,
+                    self.ao_x,
+                    self.ao_y,
+                    self._vx,
+                    self._vy,
+                    exc,
+                )
+                self._readback_warning_logged = True
+            else:
+                LOGGER.debug("Hardware AO readback still unavailable; preserved outputs remain cached.")
         return self._vx, self._vy
 
     def write_outputs(self, vx: float, vy: float) -> tuple[float, float]:
-        self._vx = clamp_voltage(vx)
-        self._vy = clamp_voltage(vy)
-        self._receive()
+        self._cache_outputs_without_writing(vx, vy)
         self._daq.write_x()
         return self.read_outputs()
 
     def close(self) -> None:
+        LOGGER.info(
+            "Closing DAQ interface for %s (%s,%s) without altering scanner AO outputs.",
+            self.dev_name,
+            self.ao_x,
+            self.ao_y,
+        )
         try:
             self._daq.ao_task.close()
         except Exception:
@@ -419,6 +520,8 @@ class DaqXYWindow(QMainWindow):
         self._mapping = mapping
         self._enabled = False
         self._syncing = False
+        self._readback_uncertain = False
+        self._readback_status = ""
         self._vmin = V_MIN_DEFAULT
         self._vmax = V_MAX_DEFAULT
 
@@ -427,7 +530,7 @@ class DaqXYWindow(QMainWindow):
         else:
             self._daq = DaqInterface(dev_name, ao_x, ao_y)
 
-        self._vx, self._vy = self._daq.read_outputs()
+        self._pull_outputs_from_daq()
         self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
         self._target_vx = self._vx
         self._target_vy = self._vy
@@ -626,22 +729,35 @@ class DaqXYWindow(QMainWindow):
             self.lbl_status.setText(f"Demo mode: {self._demo_reason}")
             return
         en = "ON" if self._enabled else "OFF"
+        readback_state = "cached/uncertain" if self._readback_uncertain else "measured"
+        self.lbl_status.setToolTip(self._readback_status)
         self.lbl_status.setText(
             f"Output {en} | V_hw=({self._vx:.3f}, {self._vy:.3f}) V | "
             f"R=({self._rx:.3f}, {self._ry:.3f}) | "
+            f"readback={readback_state} | "
             f"invert=({int(self._mapping.invert_x)},{int(self._mapping.invert_y)}) "
             f"rot={'on' if self._mapping.rotation_enabled else 'off'}:{self._mapping.rotation_deg:.1f}deg "
             f"ch=({self._ao_x},{self._ao_y}) dev={self._selected_device} "
             f"range=[{self._vmin:.1f},{self._vmax:.1f}]"
         )
 
-    def _refresh_from_hardware(self) -> None:
+    def _pull_outputs_from_daq(self) -> None:
         self._vx, self._vy = self._daq.read_outputs()
-        self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
+        self._readback_uncertain = bool(getattr(self._daq, "readback_uncertain", False))
+        self._readback_status = str(
+            getattr(self._daq, "readback_status", "Hardware AO readback status is unavailable.")
+        )
+
+    def _freeze_targets_at_current_output(self) -> None:
         self._target_vx = self._vx
         self._target_vy = self._vy
         self._target_rx = self._rx
         self._target_ry = self._ry
+
+    def _refresh_from_hardware(self) -> None:
+        self._pull_outputs_from_daq()
+        self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
+        self._freeze_targets_at_current_output()
 
     def _set_target_hw(self, vx: float, vy: float) -> None:
         self._target_vx = clamp_voltage(vx)
@@ -689,6 +805,7 @@ class DaqXYWindow(QMainWindow):
         self._enabled = bool(checked)
         if not self._enabled:
             self._ramp_timer.stop()
+            self._freeze_targets_at_current_output()
         self._update_status()
 
     def _on_hw_control_changed(self, axis: str, value: float) -> None:
@@ -723,8 +840,29 @@ class DaqXYWindow(QMainWindow):
             self._ramp_timer.stop()
             return
         nx, ny = _next_ramp_point(self._vx, self._vy, self._target_vx, self._target_vy, self.ramp.step_v)
-        self._vx, self._vy = self._daq.write_outputs(nx, ny)
-        self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
+        try:
+            self._vx, self._vy = self._daq.write_outputs(nx, ny)
+            self._readback_uncertain = bool(getattr(self._daq, "readback_uncertain", False))
+            self._readback_status = str(
+                getattr(self._daq, "readback_status", "Hardware AO readback status is unavailable.")
+            )
+            self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
+        except Exception:
+            self._ramp_timer.stop()
+            self._enabled = False
+            self.chk_enable.blockSignals(True)
+            self.chk_enable.setChecked(False)
+            self.chk_enable.blockSignals(False)
+            self._freeze_targets_at_current_output()
+            LOGGER.exception("Scanner control lost during ramp; preserved existing AO outputs and stopped further writes.")
+            if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() != "offscreen":
+                QMessageBox.warning(
+                    self,
+                    "Scanner Control Lost",
+                    "A DAQ write/read error occurred. The UI stopped ramping and did not force the scanner outputs to 0 V.",
+                )
+            self._sync_ui()
+            return
         if self._debug_mapping:
             LOGGER.info(
                 "WRITE V_hw=(%.4f, %.4f) -> R=(%.4f, %.4f) invert=(%s,%s) rot=%s %.2f",
@@ -770,14 +908,22 @@ class DaqXYWindow(QMainWindow):
             rotation_deg=float(self.spn_rot_deg.value()) if self.chk_rot_en.isChecked() else 0.0,
         )
 
+        _ramp_was_active = self._ramp_timer.isActive()
+        daq_connection_swapped = False
         try:
             device_or_channel_changed = bool(
                 (not self._demo_reason) and (dev != self._selected_device or chx != self._ao_x or chy != self._ao_y)
             )
             if not self._demo_reason and (dev != self._selected_device or chx != self._ao_x or chy != self._ao_y):
+                if _ramp_was_active:
+                    LOGGER.info(
+                        "Stopping active ramp before reconnecting DAQ channels so scanner outputs remain undisturbed."
+                    )
+                    self._ramp_timer.stop()
                 new_daq = DaqInterface(dev, chx, chy)
                 old_daq = self._daq
                 self._daq = new_daq
+                daq_connection_swapped = True
                 self._selected_device = dev
                 self._ao_x = chx
                 self._ao_y = chy
@@ -799,6 +945,25 @@ class DaqXYWindow(QMainWindow):
                 self._target_rx = self._rx
                 self._target_ry = self._ry
             self._sync_ui()
+        except Exception as exc:
+            # If the apply failed after stopping an in-flight ramp, restart the ramp
+            # only when we are still on the original DAQ connection.
+            if (
+                _ramp_was_active
+                and self._enabled
+                and not self._ramp_timer.isActive()
+                and not daq_connection_swapped
+            ):
+                LOGGER.warning(
+                    "Apply Mapping failed; restarting interrupted ramp towards previous target "
+                    "using existing DAQ connection. Error: %s", exc
+                )
+                self._start_ramp()
+            self._sync_ui()
+            QMessageBox.warning(self, "Apply Mapping", str(exc))
+            return
+
+        try:
             _save_persisted_mapping(
                 PersistedMapping(
                     selected_device_name=self._selected_device,
@@ -811,11 +976,18 @@ class DaqXYWindow(QMainWindow):
                 )
             )
         except Exception as exc:
-            QMessageBox.warning(self, "Apply Mapping", str(exc))
+            LOGGER.warning("Applied mapping successfully, but failed to save persisted settings: %s", exc, exc_info=True)
+            if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() != "offscreen":
+                QMessageBox.warning(
+                    self,
+                    "Apply Mapping",
+                    f"Mapping was applied, but settings could not be saved: {exc}",
+                )
 
     def closeEvent(self, e: Any) -> None:  # type: ignore[override]
         try:
             self._ramp_timer.stop()
+            LOGGER.info("Closing scanner UI without altering current AO outputs.")
             self._daq.close()
         finally:
             super().closeEvent(e)
@@ -884,15 +1056,31 @@ def _auto_window(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -
             demo_reason=reason,
         )
 
-    return DaqXYWindow(
-        dev_name=selected_dev,
-        ao_x=selected_x,
-        ao_y=selected_y,
-        mapping=mapping,
-        devices=devices,
-        channels_by_device=channels_by_device,
-        demo_reason=None,
-    )
+    try:
+        return DaqXYWindow(
+            dev_name=selected_dev,
+            ao_x=selected_x,
+            ao_y=selected_y,
+            mapping=mapping,
+            devices=devices,
+            channels_by_device=channels_by_device,
+            demo_reason=None,
+        )
+    except Exception as exc:
+        # Device was detected but connection failed (e.g. USB hot-unplug between
+        # enumeration and the constructor). Fall back to demo mode so the process
+        # does not crash.
+        reason = f"DAQ connection failed for {selected_dev} ({selected_x},{selected_y}): {exc}"
+        LOGGER.error("Real DAQ startup failed; falling back to demo mode. %s", reason, exc_info=True)
+        return DaqXYWindow(
+            dev_name=selected_dev,
+            ao_x=selected_x,
+            ao_y=selected_y,
+            mapping=mapping,
+            devices=devices,
+            channels_by_device=channels_by_device,
+            demo_reason=reason,
+        )
 
 
 def launch(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> tuple[QApplication, DaqXYWindow]:
