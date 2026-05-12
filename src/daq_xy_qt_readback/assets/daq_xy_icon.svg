@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="DAQ XY Control icon">
+  <defs>
+    <linearGradient id="bg" x1="32" y1="20" x2="224" y2="236" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#172033"/>
+      <stop offset="1" stop-color="#0b1220"/>
+    </linearGradient>
+    <linearGradient id="trace" x1="58" y1="186" x2="205" y2="68" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22c55e"/>
+      <stop offset="1" stop-color="#38bdf8"/>
+    </linearGradient>
+  </defs>
+  <rect x="18" y="18" width="220" height="220" rx="42" fill="url(#bg)"/>
+  <rect x="36" y="36" width="184" height="184" rx="24" fill="#101827" stroke="#2f3f5f" stroke-width="6"/>
+  <path d="M72 61v134M112 61v134M152 61v134M192 61v134M61 72h134M61 112h134M61 152h134M61 192h134"
+        stroke="#334155" stroke-width="4" stroke-linecap="round" opacity=".72"/>
+  <path d="M61 195h137M61 195V58" stroke="#e2e8f0" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M61 195h137M61 195V58" stroke="#64748b" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M67 184C91 166 99 125 121 117C143 109 151 145 170 133C188 122 188 82 203 70"
+        fill="none" stroke="#020617" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/>
+  <path d="M67 184C91 166 99 125 121 117C143 109 151 145 170 133C188 122 188 82 203 70"
+        fill="none" stroke="url(#trace)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="67" cy="184" r="13" fill="#a3e635" stroke="#ecfccb" stroke-width="5"/>
+  <circle cx="121" cy="117" r="11" fill="#22d3ee" stroke="#cffafe" stroke-width="5"/>
+  <circle cx="203" cy="70" r="13" fill="#fb7185" stroke="#ffe4e6" stroke-width="5"/>
+  <path d="M191 185h21M201.5 174.5v21M70 47l10 16H60l10-16ZM209 185l16 10-16 10v-20Z"
+        fill="#e2e8f0"/>
+</svg>

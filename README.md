@@ -5,6 +5,8 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 - Output transitions are ramped (no instant jumps).
 - Includes `Home` and `Ground (ramp to 0 V)` actions.
 - Uses `iv_automation.DaqControl` with a real NI-DAQ device (no simulator fallback).
+- Uses one bundled app icon for the Qt window and Windows taskbar identity.
+- Uses a modern console layout with status badges, a larger XY pad, and separated control/setup panels.
 
 ## Run the app
 ```bat
@@ -19,6 +21,10 @@ It will:
 1. Create `.venv/` if missing.
 2. Install dependencies from `requirements.txt`.
 3. Launch the app.
+
+To create a desktop shortcut that uses the same app icon, double-click
+`Create_DAQ_XY_Desktop_Shortcut.bat`.
+Run it again after icon updates to refresh the shortcut target and icon path.
 
 Optional arguments:
 
@@ -56,12 +62,18 @@ python -m compileall .
 
 ```text
 daq_xy_qt_readback_repo/
+  Create_DAQ_XY_Desktop_Shortcut.bat
+  Start_DAQ_XY_UI.bat
   src/daq_xy_qt_readback/
+    assets/
+      daq_xy_control_unique.ico
+      daq_xy_control_unique.svg
+      daq_xy_icon.ico
+      daq_xy_icon.svg
     __main__.py
     daq_xy_qt_readback.py
   scripts/
     smoke_check.py
-  Start_DAQ_XY_UI.bat
   requirements.txt
   pyproject.toml
 ```

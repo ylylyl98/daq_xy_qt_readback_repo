@@ -5,19 +5,22 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import ExitStack
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
 import sys
 from typing import Any
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QPainter, QPen
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -25,7 +28,10 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
+    QStyle,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -42,8 +48,153 @@ from .coordinate_transform import (
 
 STEP_PER_MOVE = 0.05
 LOGGER = logging.getLogger(__name__)
+APP_DISPLAY_NAME = "DAQ XY Control"
+APP_USER_MODEL_ID = "daq_xy_qt_readback.DAQXYControl"
+_ASSET_FILES = ExitStack()
 V_MIN_DEFAULT = 0.0
 V_MAX_DEFAULT = 10.0
+
+
+def _asset_file_path(filename: str) -> str | None:
+    """Return a filesystem path for a bundled asset when available."""
+    package = __package__ or "daq_xy_qt_readback"
+    try:
+        asset = resources.files(package).joinpath("assets").joinpath(filename)
+        if not asset.is_file():
+            return None
+        return str(_ASSET_FILES.enter_context(resources.as_file(asset)))
+    except Exception as exc:
+        LOGGER.debug("Unable to resolve bundled asset %s: %s", filename, exc)
+        return None
+
+
+def _load_app_icon() -> QIcon:
+    for filename in (
+        "daq_xy_control_unique.ico",
+        "daq_xy_control_unique.svg",
+        "daq_xy_icon.ico",
+        "daq_xy_icon.svg",
+    ):
+        path = _asset_file_path(filename)
+        if not path:
+            continue
+        icon = QIcon(path)
+        if not icon.isNull():
+            return icon
+        LOGGER.debug("Bundled icon could not be loaded: %s", path)
+    return QIcon()
+
+
+def _set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(ctypes.c_wchar_p(APP_USER_MODEL_ID))
+    except Exception as exc:
+        LOGGER.debug("Unable to set Windows AppUserModelID: %s", exc)
+
+
+def _set_windows_native_window_icon(window: QWidget) -> None:
+    if sys.platform != "win32":
+        return
+    icon_path = _asset_file_path("daq_xy_control_unique.ico") or _asset_file_path("daq_xy_icon.ico")
+    if not icon_path:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        image_icon = 1
+        load_from_file = 0x00000010
+        wm_seticon = 0x0080
+        icon_small = 0
+        icon_big = 1
+
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+
+        hwnd = wintypes.HWND(int(window.winId()))
+        small_icon = user32.LoadImageW(None, icon_path, image_icon, 16, 16, load_from_file)
+        big_icon = user32.LoadImageW(None, icon_path, image_icon, 32, 32, load_from_file)
+        if not small_icon and not big_icon:
+            return
+
+        previous_handles = list(getattr(window, "_daq_xy_windows_icon_handles", []))
+        new_handles = []
+        if small_icon:
+            user32.SendMessageW(hwnd, wm_seticon, icon_small, small_icon)
+            new_handles.append(small_icon)
+        if big_icon:
+            user32.SendMessageW(hwnd, wm_seticon, icon_big, big_icon)
+            new_handles.append(big_icon)
+        setattr(window, "_daq_xy_windows_icon_handles", new_handles)
+
+        if previous_handles:
+            user32.DestroyIcon.restype = wintypes.BOOL
+            user32.DestroyIcon.argtypes = [wintypes.HANDLE]
+            for handle in previous_handles:
+                if handle:
+                    user32.DestroyIcon(handle)
+    except Exception as exc:
+        LOGGER.debug("Unable to set native Windows taskbar icon: %s", exc)
+
+
+def _release_windows_native_window_icon(window: QWidget) -> None:
+    if sys.platform != "win32":
+        return
+    handles = list(getattr(window, "_daq_xy_windows_icon_handles", []))
+    if not handles:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        user32.DestroyIcon.restype = wintypes.BOOL
+        user32.DestroyIcon.argtypes = [wintypes.HANDLE]
+        for handle in handles:
+            if handle:
+                user32.DestroyIcon(handle)
+    except Exception:
+        LOGGER.debug("Unable to release native Windows icon handles.", exc_info=True)
+    setattr(window, "_daq_xy_windows_icon_handles", [])
+
+
+def _apply_window_icon(window: QWidget) -> None:
+    icon = _load_app_icon()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
+    _set_windows_native_window_icon(window)
+
+
+def _configure_application(app: QApplication) -> None:
+    _set_windows_app_user_model_id()
+    app.setOrganizationName("Instrument Control")
+    app.setApplicationName(APP_DISPLAY_NAME)
+    app.setApplicationDisplayName(APP_DISPLAY_NAME)
+    app.setDesktopFileName(APP_USER_MODEL_ID)
+    icon = _load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
+
+
+def _qt_application() -> QApplication:
+    _set_windows_app_user_model_id()
+    app = QApplication.instance() or QApplication(sys.argv)
+    _configure_application(app)
+    return app
 
 try:
     from iv_automation import DaqControl as _RealDaqControl
@@ -354,9 +505,12 @@ class XyPad(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setMinimumSize(240, 240)
+        self.setMinimumSize(360, 360)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._rx = 0.0
         self._ry = 0.0
+        self._target_rx = 0.0
+        self._target_ry = 0.0
         self._xmin = 0.0
         self._xmax = 10.0
         self._ymin = 0.0
@@ -372,6 +526,11 @@ class XyPad(QWidget):
     def set_real_xy(self, rx: float, ry: float) -> None:
         self._rx = float(rx)
         self._ry = float(ry)
+        self.update()
+
+    def set_target_real_xy(self, rx: float, ry: float) -> None:
+        self._target_rx = float(rx)
+        self._target_ry = float(ry)
         self.update()
 
     def set_rotation(self, enabled: bool, deg: float) -> None:
@@ -439,10 +598,15 @@ class XyPad(QWidget):
         x0, y0, side = self._plot_rect()
         x1 = x0 + side - 1.0
         y1 = y0 + side - 1.0
-        pen = QPen()
-        pen.setWidth(1)
-        p.setPen(pen)
-        p.drawRect(int(x0), int(y0), int(side - 1.0), int(side - 1.0))
+
+        p.fillRect(self.rect(), QColor("#f8fafc"))
+        plot_rect = QRectF(x0, y0, side - 1.0, side - 1.0)
+        p.setPen(QPen(QColor("#cbd5e1"), 1.2))
+        p.setBrush(QColor("#ffffff"))
+        p.drawRoundedRect(plot_rect, 12.0, 12.0)
+
+        grid_pen = QPen(QColor("#e2e8f0"), 1)
+        p.setPen(grid_pen)
         for i in range(1, 5):
             xi = x0 + i * (side / 5.0)
             yi = y0 + i * (side / 5.0)
@@ -451,18 +615,32 @@ class XyPad(QWidget):
 
         # Reachable region boundary in real-space (mapped from hardware square).
         if len(self._boundary_real) >= 2:
+            boundary_path = QPainterPath()
+            sx, sy = self._to_plot(*self._boundary_real[0])
+            boundary_path.moveTo(QPointF(sx, sy))
             for i in range(len(self._boundary_real)):
                 ax, ay = self._boundary_real[i]
                 bx, by = self._boundary_real[(i + 1) % len(self._boundary_real)]
                 p1x, p1y = self._to_plot(ax, ay)
                 p2x, p2y = self._to_plot(bx, by)
-                p.drawLine(int(p1x), int(p1y), int(p2x), int(p2y))
+                if i > 0:
+                    boundary_path.lineTo(QPointF(p1x, p1y))
+                boundary_path.lineTo(QPointF(p2x, p2y))
+            boundary_path.closeSubpath()
+            fill = QColor("#38bdf8")
+            fill.setAlpha(30)
+            p.fillPath(boundary_path, fill)
+            boundary_pen = QPen(QColor("#0284c7"), 2)
+            boundary_pen.setStyle(Qt.PenStyle.DashLine)
+            p.setPen(boundary_pen)
+            p.drawPath(boundary_path)
 
         # Fixed display axes in real-space frame.
         cxp, cyp = self._to_plot((self._view_xmin + self._view_xmax) * 0.5, (self._view_ymin + self._view_ymax) * 0.5)
         axis_len = side * 0.22
         x_tip = (cxp + axis_len, cyp)
         y_tip = (cxp, cyp - axis_len)
+        p.setPen(QPen(QColor("#64748b"), 1.6))
         p.drawLine(int(cxp), int(cyp), int(x_tip[0]), int(x_tip[1]))
         p.drawLine(int(cxp), int(cyp), int(y_tip[0]), int(y_tip[1]))
         p.drawLine(int(x_tip[0]), int(x_tip[1]), int(x_tip[0] - 8), int(x_tip[1] - 4))
@@ -472,16 +650,39 @@ class XyPad(QWidget):
         p.drawText(int(x_tip[0] + 6), int(x_tip[1] + 4), "X")
         p.drawText(int(y_tip[0] + 6), int(y_tip[1] + 4), "Y")
 
+        # Target setpoint in real-space.
+        tx, ty = self._to_plot(self._target_rx, self._target_ry)
+        target_pen = QPen(QColor("#f59e0b"), 2)
+        target_pen.setStyle(Qt.PenStyle.DashLine)
+        p.setPen(target_pen)
+        p.drawLine(int(tx - 8), int(ty), int(tx + 8), int(ty))
+        p.drawLine(int(tx), int(ty - 8), int(tx), int(ty + 8))
+        p.setBrush(QColor("#fef3c7"))
+        p.drawEllipse(QPointF(tx, ty), 4.0, 4.0)
+
         # Cursor (real-space position)
         px, py = self._to_plot(self._rx, self._ry)
-        p.drawLine(int(px - 6), int(py), int(px + 6), int(py))
-        p.drawLine(int(px), int(py - 6), int(px), int(py + 6))
+        p.setPen(QPen(QColor("#0f172a"), 2.5))
+        p.setBrush(QColor("#22c55e"))
+        p.drawEllipse(QPointF(px, py), 8.0, 8.0)
+        p.setPen(QPen(QColor("#ffffff"), 2))
+        p.drawLine(int(px - 5), int(py), int(px + 5), int(py))
+        p.drawLine(int(px), int(py - 5), int(px), int(py + 5))
 
         # Range labels.
+        label_font = QFont(p.font())
+        label_font.setPointSize(8)
+        p.setFont(label_font)
+        p.setPen(QPen(QColor("#64748b"), 1))
         p.drawText(int(x0) - 4, int(y1) + 16, f"{self._view_xmin:.2f}")
         p.drawText(int(x1) - 44, int(y1) + 16, f"{self._view_xmax:.2f}")
         p.drawText(int(x0) - 44, int(y1), f"{self._view_ymin:.2f}")
         p.drawText(int(x0) - 44, int(y0) + 10, f"{self._view_ymax:.2f}")
+
+        if not self.isEnabled():
+            veil = QColor("#f8fafc")
+            veil.setAlpha(150)
+            p.fillRect(self.rect(), veil)
 
 
 @dataclass
@@ -505,6 +706,7 @@ class DaqXYWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setWindowTitle(f"NI-DAQ XY Control - Ramped {STEP_PER_MOVE}V @ 100ms")
+        _apply_window_icon(self)
         self._demo_reason = demo_reason
         self._debug_mapping = os.environ.get("DAQ_XY_DEBUG_MAPPING", "").strip().lower() in {
             "1",
@@ -520,6 +722,7 @@ class DaqXYWindow(QMainWindow):
         self._mapping = mapping
         self._enabled = False
         self._syncing = False
+        self._mapping_dirty = False
         self._readback_uncertain = False
         self._readback_status = ""
         self._vmin = V_MIN_DEFAULT
@@ -547,26 +750,117 @@ class DaqXYWindow(QMainWindow):
         self._apply_demo_mode_if_needed()
 
     def _build_ui(self) -> None:
+        self._apply_modern_style()
         cw = QWidget()
+        cw.setObjectName("appRoot")
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(14)
 
-        top = QHBoxLayout()
-        self.chk_enable = QCheckBox("Enable Output")
-        self.btn_home = QPushButton("Home (real 5.0,5.0)")
-        self.btn_ground = QPushButton("Ground (ramp outputs to 0V)")
-        top.addWidget(self.chk_enable)
-        top.addWidget(self.btn_home)
-        top.addWidget(self.btn_ground)
-        top.addStretch(1)
-        root.addLayout(top)
+        root.addWidget(self._build_command_bar())
 
-        center = QHBoxLayout()
+        workspace = QHBoxLayout()
+        workspace.setSpacing(14)
+        workspace.addWidget(self._build_xy_panel(), 5)
+        workspace.addWidget(self._build_control_stack(), 3)
+        root.addLayout(workspace, 1)
+
+        root.addWidget(self._build_status_bar())
+        self._connect_controls()
+
+    def _build_command_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("commandBar")
+        bar.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        title_stack = QVBoxLayout()
+        title_stack.setSpacing(1)
+        title = QLabel(APP_DISPLAY_NAME)
+        title.setObjectName("appTitle")
+        subtitle = QLabel(f"Ramped output: {STEP_PER_MOVE:.2f} V every 100 ms")
+        subtitle.setObjectName("appSubtitle")
+        title_stack.addWidget(title)
+        title_stack.addWidget(subtitle)
+        layout.addLayout(title_stack, 1)
+
+        self.lbl_output_chip = self._chip("OFF", "off")
+        self.lbl_output_chip.setToolTip("Output state")
+        self.lbl_readback_chip = self._chip("--", "neutral")
+        self.lbl_readback_chip.setToolTip("Readback state")
+        self.lbl_device_chip = self._chip(self._selected_device or "--", "neutral")
+        self.lbl_device_chip.setToolTip("Active device")
+        layout.addWidget(self.lbl_output_chip)
+        layout.addWidget(self.lbl_readback_chip)
+        layout.addWidget(self.lbl_device_chip)
+
+        self.chk_enable = QCheckBox("Output")
+        self.chk_enable.setToolTip("Enable ramped DAQ output writes.")
+        self.chk_enable.setObjectName("enableOutput")
+        self.btn_home = QPushButton("Home")
+        self.btn_home.setToolTip("Move to real-space center (5.0, 5.0).")
+        self.btn_home.setProperty("role", "secondary")
+        self.btn_ground = QPushButton("Ground")
+        self.btn_ground.setToolTip("Ramp hardware outputs to 0 V.")
+        self.btn_ground.setProperty("role", "danger")
+        layout.addWidget(self.chk_enable)
+        layout.addWidget(self.btn_home)
+        layout.addWidget(self.btn_ground)
+        return bar
+
+    def _build_xy_panel(self) -> QWidget:
+        panel = QGroupBox("XY Position")
+        panel.setObjectName("xyPanel")
+        layout = QVBoxLayout(panel)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 18, 14, 14)
+
+        metrics = QHBoxLayout()
+        metrics.setSpacing(8)
+        self.lbl_real_value = self._metric_label("Real\nX -- / Y --")
+        self.lbl_target_value = self._metric_label("Target\nX -- / Y --")
+        self.lbl_hw_value = self._metric_label("Hardware\nX -- / Y --")
+        metrics.addWidget(self.lbl_real_value)
+        metrics.addWidget(self.lbl_target_value)
+        metrics.addWidget(self.lbl_hw_value)
+        layout.addLayout(metrics)
+
         self.pad = XyPad()
-        center.addWidget(self.pad, 2)
+        layout.addWidget(self.pad, 1)
+        return panel
 
-        volt_box = QGroupBox("Hardware Outputs")
+    def _build_control_stack(self) -> QWidget:
+        tabs = QTabWidget()
+        tabs.setObjectName("controlTabs")
+
+        control_page = QWidget()
+        control_layout = QVBoxLayout(control_page)
+        control_layout.setContentsMargins(0, 10, 0, 0)
+        control_layout.setSpacing(12)
+        control_layout.addWidget(self._build_output_panel())
+        control_layout.addWidget(self._build_nudge_panel())
+        control_layout.addStretch(1)
+
+        setup_page = QWidget()
+        setup_layout = QVBoxLayout(setup_page)
+        setup_layout.setContentsMargins(0, 10, 0, 0)
+        setup_layout.setSpacing(12)
+        setup_layout.addWidget(self._build_mapping_panel())
+        setup_layout.addStretch(1)
+
+        tabs.addTab(control_page, "Control")
+        tabs.addTab(setup_page, "Setup")
+        return tabs
+
+    def _build_output_panel(self) -> QWidget:
+        volt_box = QGroupBox("Hardware Output")
         vf = QFormLayout(volt_box)
+        vf.setContentsMargins(14, 20, 14, 14)
+        vf.setSpacing(10)
+        vf.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.sld_x = QSlider(Qt.Orientation.Horizontal)
         self.sld_y = QSlider(Qt.Orientation.Horizontal)
         self.sld_x.setRange(0, 1000)
@@ -577,48 +871,77 @@ class DaqXYWindow(QMainWindow):
             spn.setRange(0.0, 10.0)
             spn.setDecimals(3)
             spn.setSingleStep(STEP_PER_MOVE)
+            spn.setSuffix(" V")
+            spn.setFixedWidth(96)
         vf.addRow(QLabel("X (V)"), self._hbox(self.sld_x, self.spn_x))
         vf.addRow(QLabel("Y (V)"), self._hbox(self.sld_y, self.spn_y))
-        center.addWidget(volt_box, 3)
+        return volt_box
 
-        nudge_box = QGroupBox(f"Nudge Real-Space (+/-{STEP_PER_MOVE})")
+    def _build_nudge_panel(self) -> QWidget:
+        nudge_box = QGroupBox("Nudge Real-Space")
         ng = QGridLayout(nudge_box)
-        self.btn_left = QPushButton("Left")
-        self.btn_right = QPushButton("Right")
-        self.btn_up = QPushButton("Up")
-        self.btn_down = QPushButton("Down")
-        ng.addWidget(self.btn_up, 0, 1)
-        ng.addWidget(self.btn_left, 1, 0)
-        ng.addWidget(self.btn_right, 1, 2)
-        ng.addWidget(self.btn_down, 2, 1)
-        center.addWidget(nudge_box, 2)
-        root.addLayout(center)
+        ng.setContentsMargins(14, 20, 14, 14)
+        ng.setSpacing(8)
+        self.lbl_step_value = self._metric_label(f"Step {STEP_PER_MOVE:.2f} V")
+        self.btn_left = self._nav_button(QStyle.StandardPixmap.SP_ArrowLeft, "Nudge left")
+        self.btn_right = self._nav_button(QStyle.StandardPixmap.SP_ArrowRight, "Nudge right")
+        self.btn_up = self._nav_button(QStyle.StandardPixmap.SP_ArrowUp, "Nudge up")
+        self.btn_down = self._nav_button(QStyle.StandardPixmap.SP_ArrowDown, "Nudge down")
+        ng.addWidget(self.lbl_step_value, 0, 0, 1, 3)
+        ng.addWidget(self.btn_up, 1, 1)
+        ng.addWidget(self.btn_left, 2, 0)
+        ng.addWidget(self.btn_right, 2, 2)
+        ng.addWidget(self.btn_down, 3, 1)
+        ng.setColumnStretch(0, 1)
+        ng.setColumnStretch(1, 1)
+        ng.setColumnStretch(2, 1)
+        return nudge_box
 
+    def _build_mapping_panel(self) -> QWidget:
         map_box = QGroupBox("Device / Mapping")
         mf = QFormLayout(map_box)
+        mf.setContentsMargins(14, 20, 14, 14)
+        mf.setSpacing(10)
+        mf.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.cmb_device = QComboBox()
         self.btn_rescan = QPushButton("Rescan")
+        self.btn_rescan.setProperty("role", "secondary")
         self.cmb_x_ch = QComboBox()
         self.cmb_y_ch = QComboBox()
         self.chk_inv_x = QCheckBox("Invert X")
         self.chk_inv_y = QCheckBox("Invert Y")
-        self.chk_rot_en = QCheckBox("Enable Rotation")
+        self.chk_rot_en = QCheckBox("Rotation")
         self.spn_rot_deg = QDoubleSpinBox()
         self.spn_rot_deg.setRange(-360.0, 360.0)
         self.spn_rot_deg.setDecimals(3)
         self.spn_rot_deg.setSingleStep(1.0)
+        self.spn_rot_deg.setSuffix(" deg")
         self.btn_apply = QPushButton("Apply")
+        self.btn_apply.setProperty("role", "primary")
+        self.lbl_mapping_pending = self._chip("Active", "ok")
+        self.lbl_mapping_pending.setObjectName("mappingState")
         mf.addRow("Device", self._hbox(self.cmb_device, self.btn_rescan))
         mf.addRow("X Channel", self.cmb_x_ch)
         mf.addRow("Y Channel", self.cmb_y_ch)
         mf.addRow("Inversion", self._hbox(self.chk_inv_x, self.chk_inv_y))
         mf.addRow("Rotation", self._hbox(self.chk_rot_en, self.spn_rot_deg))
+        mf.addRow("State", self.lbl_mapping_pending)
         mf.addRow("Apply", self.btn_apply)
-        root.addWidget(map_box)
+        return map_box
 
+    def _build_status_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("bottomStatus")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(10)
         self.lbl_status = QLabel("")
-        root.addWidget(self.lbl_status)
+        self.lbl_status.setObjectName("statusDetail")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status, 1)
+        return bar
 
+    def _connect_controls(self) -> None:
         self.chk_enable.toggled.connect(self._on_enable_toggled)
         self.btn_home.clicked.connect(lambda: self._set_target_real(5.0, 5.0))
         self.btn_ground.clicked.connect(self._ground_outputs)
@@ -633,16 +956,278 @@ class DaqXYWindow(QMainWindow):
         self.btn_down.clicked.connect(lambda: self._nudge_real(0.0, -STEP_PER_MOVE))
         self.btn_rescan.clicked.connect(self._on_rescan_devices)
         self.cmb_device.currentTextChanged.connect(self._on_device_changed_pending)
-        self.chk_rot_en.toggled.connect(lambda checked: self.spn_rot_deg.setEnabled(bool(checked)))
+        self.cmb_x_ch.currentTextChanged.connect(lambda _: self._update_mapping_dirty())
+        self.cmb_y_ch.currentTextChanged.connect(lambda _: self._update_mapping_dirty())
+        self.chk_inv_x.toggled.connect(lambda _: self._update_mapping_dirty())
+        self.chk_inv_y.toggled.connect(lambda _: self._update_mapping_dirty())
+        self.chk_rot_en.toggled.connect(self._on_rotation_enabled_changed)
+        self.spn_rot_deg.valueChanged.connect(lambda _: self._update_mapping_dirty())
         self.btn_apply.clicked.connect(self._on_apply_mapping)
+
+    def _chip(self, text: str, state: str = "neutral") -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("statusChip")
+        label.setProperty("state", state)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setMinimumWidth(62)
+        label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        return label
+
+    def _metric_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("metricLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        label.setMinimumWidth(0)
+        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        return label
+
+    def _nav_button(self, icon: QStyle.StandardPixmap, tooltip: str) -> QPushButton:
+        btn = QPushButton()
+        btn.setObjectName("navButton")
+        btn.setIcon(self.style().standardIcon(icon))
+        btn.setIconSize(QSize(22, 22))
+        btn.setFixedSize(46, 42)
+        btn.setToolTip(tooltip)
+        btn.setAccessibleName(tooltip)
+        return btn
+
+    def _apply_modern_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget#appRoot {
+                background: #f4f7f9;
+                color: #17202a;
+                font-size: 10pt;
+            }
+            QFrame#commandBar, QFrame#bottomStatus {
+                background: #ffffff;
+                border: 1px solid #d7dee8;
+                border-radius: 8px;
+            }
+            QLabel#appTitle {
+                color: #111827;
+                font-size: 16pt;
+                font-weight: 700;
+            }
+            QLabel#appSubtitle {
+                color: #5b6678;
+                font-size: 9pt;
+            }
+            QGroupBox {
+                background: #ffffff;
+                border: 1px solid #d7dee8;
+                border-radius: 8px;
+                margin-top: 14px;
+                font-weight: 650;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 6px;
+                color: #243244;
+            }
+            QTabWidget#controlTabs::pane {
+                border: 0;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: #e9eef5;
+                border: 1px solid #d7dee8;
+                border-bottom-color: #cbd5e1;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 7px 18px;
+                margin-right: 4px;
+                color: #475569;
+                font-weight: 650;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #111827;
+                border-bottom-color: #ffffff;
+            }
+            QLabel#statusChip, QLabel#mappingState, QLabel#metricLabel {
+                border: 1px solid #d7dee8;
+                border-radius: 6px;
+                padding: 4px 7px;
+                background: #f8fafc;
+                color: #243244;
+                font-weight: 600;
+            }
+            QLabel#statusChip[state="on"] {
+                background: #dcfce7;
+                border-color: #86efac;
+                color: #166534;
+            }
+            QLabel#statusChip[state="off"] {
+                background: #f1f5f9;
+                border-color: #cbd5e1;
+                color: #475569;
+            }
+            QLabel#statusChip[state="warning"], QLabel#mappingState[state="dirty"] {
+                background: #fef3c7;
+                border-color: #fbbf24;
+                color: #92400e;
+            }
+            QLabel#statusChip[state="ok"], QLabel#mappingState[state="ok"] {
+                background: #ecfdf5;
+                border-color: #86efac;
+                color: #166534;
+            }
+            QLabel#mappingState[state="invalid"] {
+                background: #fee2e2;
+                border-color: #fca5a5;
+                color: #991b1b;
+            }
+            QLabel#metricLabel {
+                min-height: 36px;
+                font-weight: 600;
+            }
+            QLabel#statusDetail {
+                color: #334155;
+                font-size: 9pt;
+            }
+            QPushButton {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 7px 12px;
+                color: #17202a;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: #f8fafc;
+                border-color: #94a3b8;
+            }
+            QPushButton:pressed {
+                background: #e2e8f0;
+            }
+            QPushButton:disabled {
+                background: #f1f5f9;
+                color: #94a3b8;
+                border-color: #e2e8f0;
+            }
+            QPushButton[role="primary"] {
+                background: #0f766e;
+                border-color: #0f766e;
+                color: #ffffff;
+            }
+            QPushButton[role="primary"]:hover {
+                background: #115e59;
+                border-color: #115e59;
+            }
+            QPushButton[role="secondary"] {
+                background: #f8fafc;
+            }
+            QPushButton[role="danger"] {
+                background: #fee2e2;
+                border-color: #fecaca;
+                color: #991b1b;
+            }
+            QPushButton[role="danger"]:hover {
+                background: #fecaca;
+            }
+            QPushButton#navButton {
+                padding: 0;
+                min-width: 42px;
+                min-height: 38px;
+            }
+            QCheckBox {
+                spacing: 6px;
+                font-weight: 600;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                border: 1px solid #94a3b8;
+                background: #ffffff;
+            }
+            QCheckBox::indicator:checked {
+                background: #0f766e;
+                border-color: #0f766e;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                border-radius: 3px;
+                background: #dbe5ee;
+            }
+            QSlider::sub-page:horizontal {
+                border-radius: 3px;
+                background: #38bdf8;
+            }
+            QSlider::handle:horizontal {
+                width: 18px;
+                margin: -6px 0;
+                border-radius: 9px;
+                background: #ffffff;
+                border: 2px solid #0284c7;
+            }
+            QComboBox, QDoubleSpinBox {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 5px 7px;
+                min-height: 24px;
+            }
+            QComboBox:focus, QDoubleSpinBox:focus {
+                border-color: #0284c7;
+            }
+            """
+        )
 
     def _hbox(self, *widgets: QWidget) -> QWidget:
         w = QWidget()
         l = QHBoxLayout(w)
         l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(8)
         for it in widgets:
             l.addWidget(it)
         return w
+
+    def _set_widget_state(self, widget: QWidget, state: str) -> None:
+        widget.setProperty("state", state)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
+
+    def _set_chip(self, label: QLabel, text: str, state: str) -> None:
+        label.setText(text)
+        self._set_widget_state(label, state)
+
+    def _on_rotation_enabled_changed(self, checked: bool) -> None:
+        self.spn_rot_deg.setEnabled(bool(checked))
+        self._update_mapping_dirty()
+
+    def _update_mapping_dirty(self) -> None:
+        if not hasattr(self, "btn_apply"):
+            return
+        dev = self.cmb_device.currentText().strip()
+        chx = self.cmb_x_ch.currentText().strip()
+        chy = self.cmb_y_ch.currentText().strip()
+        rotation_enabled = self.chk_rot_en.isChecked()
+        rotation_deg = float(self.spn_rot_deg.value()) if rotation_enabled else 0.0
+        dirty = any(
+            (
+                dev != self._selected_device,
+                chx != self._ao_x,
+                chy != self._ao_y,
+                self.chk_inv_x.isChecked() != self._mapping.invert_x,
+                self.chk_inv_y.isChecked() != self._mapping.invert_y,
+                rotation_enabled != self._mapping.rotation_enabled,
+                abs(rotation_deg - self._mapping.rotation_deg) > 1e-9,
+            )
+        )
+        valid = bool(chx and chy and chx != chy)
+        self._mapping_dirty = dirty
+        self.btn_apply.setEnabled(bool(dirty and valid))
+        if not valid:
+            self._set_chip(self.lbl_mapping_pending, "Invalid", "invalid")
+        elif dirty:
+            self._set_chip(self.lbl_mapping_pending, "Pending", "dirty")
+        else:
+            self._set_chip(self.lbl_mapping_pending, "Active", "ok")
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.chk_enable.setEnabled(enabled)
@@ -673,6 +1258,7 @@ class DaqXYWindow(QMainWindow):
         self.spn_rot_deg.setEnabled(self.chk_rot_en.isChecked())
         self.pad.set_voltage_range(self._vmin, self._vmax, self._vmin, self._vmax)
         self._update_pad_projection()
+        self._update_mapping_dirty()
 
     def _update_pad_projection(self) -> None:
         poly = reachable_real_polygon(self._mapping)
@@ -708,6 +1294,7 @@ class DaqXYWindow(QMainWindow):
     def _sync_ui(self) -> None:
         self._syncing = True
         self.pad.set_real_xy(self._rx, self._ry)
+        self.pad.set_target_real_xy(self._target_rx, self._target_ry)
         self.pad.set_rotation(self._mapping.rotation_enabled, self._mapping.rotation_deg)
         self.sld_x.blockSignals(True)
         self.sld_y.blockSignals(True)
@@ -722,14 +1309,34 @@ class DaqXYWindow(QMainWindow):
         self.spn_x.blockSignals(False)
         self.spn_y.blockSignals(False)
         self._syncing = False
+        self._update_live_values()
         self._update_status()
+
+    def _update_live_values(self) -> None:
+        if not hasattr(self, "lbl_real_value"):
+            return
+        self.lbl_real_value.setText(f"Real\nX {self._rx:.3f} / Y {self._ry:.3f}")
+        self.lbl_target_value.setText(f"Target\nX {self._target_rx:.3f} / Y {self._target_ry:.3f}")
+        self.lbl_hw_value.setText(f"Hardware\nX {self._vx:.3f} V / Y {self._vy:.3f} V")
 
     def _update_status(self) -> None:
         if self._demo_reason:
+            if hasattr(self, "lbl_output_chip"):
+                self._set_chip(self.lbl_output_chip, "OFF", "off")
+                self._set_chip(self.lbl_readback_chip, "Demo", "warning")
+                self._set_chip(self.lbl_device_chip, "--", "neutral")
             self.lbl_status.setText(f"Demo mode: {self._demo_reason}")
             return
         en = "ON" if self._enabled else "OFF"
         readback_state = "cached/uncertain" if self._readback_uncertain else "measured"
+        if hasattr(self, "lbl_output_chip"):
+            self._set_chip(self.lbl_output_chip, en, "on" if self._enabled else "off")
+            self._set_chip(
+                self.lbl_readback_chip,
+                "Uncertain" if self._readback_uncertain else "Measured",
+                "warning" if self._readback_uncertain else "ok",
+            )
+            self._set_chip(self.lbl_device_chip, self._selected_device or "--", "neutral")
         self.lbl_status.setToolTip(self._readback_status)
         self.lbl_status.setText(
             f"Output {en} | V_hw=({self._vx:.3f}, {self._vy:.3f}) V | "
@@ -889,6 +1496,7 @@ class DaqXYWindow(QMainWindow):
 
     def _on_device_changed_pending(self, dev_name: str) -> None:
         self._refresh_channel_dropdowns(dev_name)
+        self._update_mapping_dirty()
 
     def _on_apply_mapping(self) -> None:
         dev = self.cmb_device.currentText().strip()
@@ -983,6 +1591,7 @@ class DaqXYWindow(QMainWindow):
                     "Apply Mapping",
                     f"Mapping was applied, but settings could not be saved: {exc}",
                 )
+        self._update_mapping_dirty()
 
     def closeEvent(self, e: Any) -> None:  # type: ignore[override]
         try:
@@ -990,6 +1599,7 @@ class DaqXYWindow(QMainWindow):
             LOGGER.info("Closing scanner UI without altering current AO outputs.")
             self._daq.close()
         finally:
+            _release_windows_native_window_icon(self)
             super().closeEvent(e)
 
 
@@ -1084,11 +1694,12 @@ def _auto_window(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -
 
 
 def launch(dev_name: str = "Dev1", ao_x: str = "ao0", ao_y: str = "ao1") -> tuple[QApplication, DaqXYWindow]:
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = _qt_application()
     _ensure_qt_in_notebook()
     win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y)
-    win.resize(980, 520)
+    win.resize(1180, 720)
     win.show()
+    _apply_window_icon(win)
     return app, win
 
 
@@ -1100,10 +1711,11 @@ def run(
     return_app_and_window: bool = False,
     block: bool = True,
 ) -> tuple[QApplication, DaqXYWindow] | None:
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = _qt_application()
     win = _auto_window(dev_name=dev_name, ao_x=ao_x, ao_y=ao_y)
-    win.resize(980, 520)
+    win.resize(1180, 720)
     win.show()
+    _apply_window_icon(win)
     if return_app_and_window:
         return app, win
     if not block:

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="DAQ XY Control icon">
+  <defs>
+    <linearGradient id="panel" x1="30" y1="24" x2="226" y2="232" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#052e35"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="scan" x1="44" y1="204" x2="210" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#facc15"/>
+      <stop offset=".46" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#fb2e8a"/>
+    </linearGradient>
+  </defs>
+  <rect x="14" y="14" width="228" height="228" rx="48" fill="url(#panel)"/>
+  <path d="M38 62h58v44H38z" fill="#facc15" stroke="#fff7ad" stroke-width="6" rx="8"/>
+  <path d="M48 72h38M48 86h24M33 72h-12M33 94h-12M101 72h12M101 94h12" stroke="#17202a" stroke-width="6" stroke-linecap="round"/>
+  <path d="M62 205 205 62M51 92 192 205" stroke="#0b1020" stroke-width="22" stroke-linecap="round"/>
+  <path d="M62 205 205 62M51 92 192 205" stroke="url(#scan)" stroke-width="13" stroke-linecap="round"/>
+  <circle cx="128" cy="128" r="47" fill="none" stroke="#e2e8f0" stroke-width="7"/>
+  <circle cx="128" cy="128" r="15" fill="#f8fafc" stroke="#0f172a" stroke-width="6"/>
+  <path d="M128 74v32M128 150v32M74 128h32M150 128h32" stroke="#e2e8f0" stroke-width="7" stroke-linecap="round"/>
+  <text x="128" y="219" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="54" font-weight="800" fill="#f8fafc" stroke="#0b1020" stroke-width="5" paint-order="stroke">XY</text>
+</svg>
