@@ -12,6 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
+from PyQt6.QtCore import Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
 import daq_xy_qt_readback.daq_xy_qt_readback as ui_mod
@@ -240,6 +242,127 @@ class WindowSafetyTests(unittest.TestCase):
             self.assertEqual(win._selected_device, "Dev1")
             self.assertTrue(win._ramp_timer.isActive())
             self.assertEqual(old_daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_compact_mode_switch_preserves_state_and_does_not_write(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win.setGeometry(80, 90, 900, 600)
+            win.show()
+            self.app.processEvents()
+            full_geometry = win.geometry()
+            win.chk_enable.setChecked(True)
+            original_target = (win._target_rx, win._target_ry)
+
+            win._enter_compact_mode()
+
+            self.assertTrue(win._compact_mode)
+            self.assertIs(win._view_stack.currentWidget(), win._compact_page)
+            self.assertEqual(win.size(), ui_mod.QSize(190, 190))
+            self.assertTrue(win.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
+            self.assertTrue(win._enabled)
+            self.assertEqual((win._target_rx, win._target_ry), original_target)
+            self.assertEqual(win._daq._daq.write_calls, [])
+
+            win._exit_compact_mode()
+            self.app.processEvents()
+
+            self.assertFalse(win._compact_mode)
+            self.assertIs(win._view_stack.currentWidget(), win._full_page)
+            self.assertEqual(win.geometry(), full_geometry)
+            self.assertTrue(win._enabled)
+            self.assertEqual((win._target_rx, win._target_ry), original_target)
+            self.assertEqual(win._daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_compact_buttons_nudge_in_all_real_space_directions(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win.chk_enable.setChecked(True)
+            win._enter_compact_mode()
+            start_x, start_y = win._target_rx, win._target_ry
+
+            win.compact_btn_left.click()
+            self.assertAlmostEqual(win._target_rx, start_x - ui_mod.STEP_PER_MOVE)
+            self.assertAlmostEqual(win._target_ry, start_y)
+            win.compact_btn_right.click()
+            self.assertAlmostEqual(win._target_rx, start_x)
+            self.assertAlmostEqual(win._target_ry, start_y)
+            win.compact_btn_up.click()
+            self.assertAlmostEqual(win._target_rx, start_x)
+            self.assertAlmostEqual(win._target_ry, start_y + ui_mod.STEP_PER_MOVE)
+            win.compact_btn_down.click()
+            self.assertAlmostEqual(win._target_rx, start_x)
+            self.assertAlmostEqual(win._target_ry, start_y)
+        finally:
+            win.close()
+
+    def test_compact_arrows_are_disabled_while_output_is_off(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._enter_compact_mode()
+            buttons = (
+                win.compact_btn_left,
+                win.compact_btn_right,
+                win.compact_btn_up,
+                win.compact_btn_down,
+            )
+            self.assertTrue(all(not button.isEnabled() for button in buttons))
+            self.assertTrue(win.btn_expand.isEnabled())
+            self.assertEqual(win._daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_compact_arrow_key_nudges_and_escape_restores_full_view(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win.chk_enable.setChecked(True)
+            win.show()
+            win._enter_compact_mode()
+            win.activateWindow()
+            self.app.processEvents()
+            start_y = win._target_ry
+
+            QTest.keyClick(win, Qt.Key.Key_Up)
+            self.assertAlmostEqual(win._target_ry, start_y + ui_mod.STEP_PER_MOVE)
+
+            QTest.keyClick(win, Qt.Key.Key_Escape)
+            self.assertFalse(win._compact_mode)
+            self.assertIs(win._view_stack.currentWidget(), win._full_page)
         finally:
             win.close()
 
