@@ -1088,11 +1088,9 @@ class DaqXYWindow(QMainWindow):
         self._update_window_title()
 
         _release_windows_native_window_icon(self)
-        compact_flags = (
-            self._full_window_flags
-            | Qt.WindowType.Tool
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
+        # Keep this as a primary window so closing it still triggers Qt's normal
+        # last-window shutdown; Qt.Tool windows are excluded from that behavior.
+        compact_flags = self._full_window_flags | Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(compact_flags)
         self.setWindowState(Qt.WindowState.WindowNoState)
         self.setFixedSize(190, 190)

@@ -245,6 +245,28 @@ class WindowSafetyTests(unittest.TestCase):
         finally:
             win.close()
 
+    def test_closing_during_ramp_preserves_last_actual_outputs(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        win.chk_enable.setChecked(True)
+        win._set_target_hw(9.0, 2.5)
+        self.assertTrue(win._ramp_timer.isActive())
+        outputs_before_close = dict(win._daq._daq.hardware)
+        writes_before_close = list(win._daq._daq.write_calls)
+
+        win.close()
+
+        self.assertFalse(win._ramp_timer.isActive())
+        self.assertEqual(win._daq._daq.hardware, outputs_before_close)
+        self.assertEqual(win._daq._daq.write_calls, writes_before_close)
+
     def test_compact_mode_switch_preserves_state_and_does_not_write(self) -> None:
         win = ui_mod.DaqXYWindow(
             dev_name="Dev1",

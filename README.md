@@ -69,6 +69,8 @@ nudge behavior.
 - Click the center restore button or press `Esc` to return to the full interface.
 - When the compact window has keyboard focus, the arrow keys nudge in the matching direction.
 - Switching views does not reconnect the DAQ or change the current output or target.
+- Closing the UI stops any unfinished ramp at its last actual position and does not ground,
+  home, or otherwise write new AO values. Reopening reads those existing outputs back.
 
 ## Expected folder structure
 
