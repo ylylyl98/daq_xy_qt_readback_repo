@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
@@ -95,6 +95,22 @@ class RampMathTests(unittest.TestCase):
         x, y = _next_ramp_point(0.0, 0.0, 1.0, 0.0, 0.2)
         self.assertAlmostEqual(x, 0.2)
         self.assertAlmostEqual(y, 0.0)
+
+
+class WindowGeometryTests(unittest.TestCase):
+    def test_centered_top_left_uses_available_screen_geometry(self) -> None:
+        available = QRect(0, 40, 1920, 1040)
+
+        position = ui_mod._centered_top_left(available, QSize(190, 190))
+
+        self.assertEqual(position, QPoint(865, 465))
+
+    def test_centered_top_left_supports_negative_monitor_coordinates(self) -> None:
+        available = QRect(-1920, -120, 1920, 1080)
+
+        position = ui_mod._centered_top_left(available, QSize(1180, 720))
+
+        self.assertEqual(position, QPoint(-1550, 60))
 
 
 class DaqInterfaceSafetyTests(unittest.TestCase):
@@ -286,10 +302,15 @@ class WindowSafetyTests(unittest.TestCase):
             original_target = (win._target_rx, win._target_ry)
 
             win._enter_compact_mode()
+            self.app.processEvents()
 
             self.assertTrue(win._compact_mode)
             self.assertIs(win._view_stack.currentWidget(), win._compact_page)
             self.assertEqual(win.size(), ui_mod.QSize(190, 190))
+            screen_center = win.screen().availableGeometry().center()
+            compact_center = win.frameGeometry().center()
+            self.assertLessEqual(abs(compact_center.x() - screen_center.x()), 3)
+            self.assertLessEqual(abs(compact_center.y() - screen_center.y()), 3)
             self.assertTrue(win.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
             self.assertTrue(win._enabled)
             self.assertEqual((win._target_rx, win._target_ry), original_target)
@@ -300,7 +321,13 @@ class WindowSafetyTests(unittest.TestCase):
 
             self.assertFalse(win._compact_mode)
             self.assertIs(win._view_stack.currentWidget(), win._full_page)
-            self.assertEqual(win.geometry(), full_geometry)
+            self.assertEqual(win.size(), full_geometry.size())
+            screen_center = win.screen().availableGeometry().center()
+            window_center = win.frameGeometry().center()
+            self.assertLessEqual(abs(window_center.x() - screen_center.x()), 3)
+            self.assertLessEqual(abs(window_center.y() - screen_center.y()), 3)
+            self.assertFalse(win.isMaximized())
+            self.assertFalse(win.isFullScreen())
             self.assertTrue(win._enabled)
             self.assertEqual((win._target_rx, win._target_ry), original_target)
             self.assertEqual(win._daq._daq.write_calls, [])
@@ -334,6 +361,40 @@ class WindowSafetyTests(unittest.TestCase):
             win.compact_btn_down.click()
             self.assertAlmostEqual(win._target_rx, start_x)
             self.assertAlmostEqual(win._target_ry, start_y)
+        finally:
+            win.close()
+
+    def test_expand_after_maximized_window_restores_normal_size(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win.resize(640, 480)
+            win.show()
+            self.app.processEvents()
+            normal_size = win.size()
+            win.showMaximized()
+            self.app.processEvents()
+            self.assertTrue(win.isMaximized())
+
+            win._enter_compact_mode()
+            self.app.processEvents()
+            win._exit_compact_mode()
+            self.app.processEvents()
+
+            self.assertFalse(win.isMaximized())
+            self.assertFalse(win.isFullScreen())
+            self.assertEqual(win.size(), normal_size)
+            screen_center = win.screen().availableGeometry().center()
+            window_center = win.frameGeometry().center()
+            self.assertLessEqual(abs(window_center.x() - screen_center.x()), 3)
+            self.assertLessEqual(abs(window_center.y() - screen_center.y()), 3)
         finally:
             win.close()
 

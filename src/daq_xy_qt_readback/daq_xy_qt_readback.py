@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -54,6 +54,14 @@ APP_USER_MODEL_ID = "daq_xy_qt_readback.DAQXYControl"
 _ASSET_FILES = ExitStack()
 V_MIN_DEFAULT = 0.0
 V_MAX_DEFAULT = 10.0
+
+
+def _centered_top_left(available_geometry: QRect, window_size: QSize) -> QPoint:
+    """Return the top-left point that centers a window in a screen's usable area."""
+    return QPoint(
+        available_geometry.left() + (available_geometry.width() - window_size.width()) // 2,
+        available_geometry.top() + (available_geometry.height() - window_size.height()) // 2,
+    )
 
 
 def _asset_file_path(filename: str) -> str | None:
@@ -731,7 +739,6 @@ class DaqXYWindow(QMainWindow):
         self._vmax = V_MAX_DEFAULT
         self._compact_mode = False
         self._full_window_geometry: Any | None = None
-        self._full_window_state: Any | None = None
         self._full_window_flags: Any | None = None
         self._full_window_minimum_size: QSize | None = None
         self._full_window_maximum_size: QSize | None = None
@@ -1072,11 +1079,28 @@ class DaqXYWindow(QMainWindow):
             state = "ON" if self._enabled else "OFF"
         self.setWindowTitle(f"DAQ XY - {state}")
 
+    def _center_on_screen(self, screen: Any | None) -> None:
+        """Center this window on ``screen`` without maximizing it."""
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        frame_geometry = self.frameGeometry()
+        self.move(_centered_top_left(screen.availableGeometry(), frame_geometry.size()))
+
+    def _center_on_screen_after_frame_update(self, screen: Any | None) -> None:
+        """Center now and again after Qt finishes rebuilding the native frame."""
+        self._center_on_screen(screen)
+        QTimer.singleShot(0, lambda: self._center_on_screen(screen))
+
     def _enter_compact_mode(self) -> None:
         if self._compact_mode:
             return
-        self._full_window_geometry = self.geometry()
-        self._full_window_state = self.windowState()
+        current_screen = self.screen()
+        if self.isMaximized() or self.isFullScreen():
+            self._full_window_geometry = self.normalGeometry()
+        else:
+            self._full_window_geometry = self.geometry()
         self._full_window_flags = self.windowFlags()
         self._full_window_minimum_size = self.minimumSize()
         self._full_window_maximum_size = self.maximumSize()
@@ -1094,15 +1118,15 @@ class DaqXYWindow(QMainWindow):
         self.setWindowFlags(compact_flags)
         self.setWindowState(Qt.WindowState.WindowNoState)
         self.setFixedSize(190, 190)
-        if self._full_window_geometry is not None:
-            self.move(self._full_window_geometry.topLeft())
         if was_visible:
             self.show()
+        self._center_on_screen_after_frame_update(current_screen)
         _apply_window_icon(self)
 
     def _exit_compact_mode(self) -> None:
         if not self._compact_mode:
             return
+        current_screen = self.screen()
         was_visible = self.isVisible()
         self._compact_mode = False
         self._view_stack.setCurrentWidget(self._full_page)
@@ -1116,13 +1140,12 @@ class DaqXYWindow(QMainWindow):
             self.setMaximumSize(self._full_window_maximum_size)
         self.setWindowState(Qt.WindowState.WindowNoState)
         if self._full_window_geometry is not None:
-            self.setGeometry(self._full_window_geometry)
-        if self._full_window_state is not None:
-            self.setWindowState(self._full_window_state)
+            self.resize(self._full_window_geometry.size())
         self._sync_compact_controls()
         self._update_window_title()
         if was_visible:
             self.show()
+        self._center_on_screen_after_frame_update(current_screen)
         _apply_window_icon(self)
 
     def _chip(self, text: str, state: str = "neutral") -> QLabel:
