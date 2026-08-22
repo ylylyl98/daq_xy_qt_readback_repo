@@ -12,8 +12,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from PyQt6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSizePolicy,
     QSlider,
+    QStackedWidget,
     QStyle,
     QTabWidget,
     QVBoxLayout,
@@ -62,6 +63,14 @@ APP_USER_MODEL_ID = "daq_xy_qt_readback.DAQXYControl"
 _ASSET_FILES = ExitStack()
 V_MIN_DEFAULT = 0.0
 V_MAX_DEFAULT = 10.0
+
+
+def _centered_top_left(available_geometry: QRect, window_size: QSize) -> QPoint:
+    """Return the top-left point that centers a window in a screen's usable area."""
+    return QPoint(
+        available_geometry.left() + (available_geometry.width() - window_size.width()) // 2,
+        available_geometry.top() + (available_geometry.height() - window_size.height()) // 2,
+    )
 
 
 def _asset_file_path(filename: str) -> str | None:
@@ -784,7 +793,8 @@ class DaqXYWindow(QMainWindow):
         demo_reason: str | None = None,
     ) -> None:
         super().__init__()
-        self.setWindowTitle(f"NI-DAQ XY Control - Ramped {STEP_PER_MOVE}V @ 100ms")
+        self._full_window_title = f"NI-DAQ XY Control - Ramped {STEP_PER_MOVE}V @ 100ms"
+        self.setWindowTitle(self._full_window_title)
         _apply_window_icon(self)
         self._demo_reason = demo_reason
         self._debug_mapping = os.environ.get("DAQ_XY_DEBUG_MAPPING", "").strip().lower() in {
@@ -810,6 +820,11 @@ class DaqXYWindow(QMainWindow):
         self._positioner_connected = False
         self._positioner_busy = False
         self._positioner_version = ""
+        self._compact_mode = False
+        self._full_window_geometry: Any | None = None
+        self._full_window_flags: Any | None = None
+        self._full_window_minimum_size: QSize | None = None
+        self._full_window_maximum_size: QSize | None = None
 
         if demo_reason:
             self._daq: DaqInterface | DemoDaqInterface = DemoDaqInterface()
@@ -854,9 +869,12 @@ class DaqXYWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self._apply_modern_style()
+
+        self._view_stack = QStackedWidget()
+        self.setCentralWidget(self._view_stack)
+
         cw = QWidget()
         cw.setObjectName("appRoot")
-        self.setCentralWidget(cw)
         root = QVBoxLayout(cw)
         root.setContentsMargins(18, 16, 18, 14)
         root.setSpacing(14)
@@ -870,7 +888,14 @@ class DaqXYWindow(QMainWindow):
         root.addLayout(workspace, 1)
 
         root.addWidget(self._build_status_bar())
+        self._view_stack.addWidget(cw)
+        self._full_page = cw
+
+        self._compact_page = self._build_compact_page()
+        self._view_stack.addWidget(self._compact_page)
+        self._view_stack.setCurrentWidget(self._full_page)
         self._connect_controls()
+        self._build_compact_shortcuts()
 
     def _build_command_bar(self) -> QWidget:
         bar = QFrame()
@@ -909,9 +934,13 @@ class DaqXYWindow(QMainWindow):
         self.btn_ground = QPushButton("Ground")
         self.btn_ground.setToolTip("Ramp hardware outputs to 0 V.")
         self.btn_ground.setProperty("role", "danger")
+        self.btn_compact = QPushButton("Compact")
+        self.btn_compact.setToolTip("Show only the directional controller and keep it above other windows.")
+        self.btn_compact.setProperty("role", "secondary")
         layout.addWidget(self.chk_enable)
         layout.addWidget(self.btn_home)
         layout.addWidget(self.btn_ground)
+        layout.addWidget(self.btn_compact)
         return bar
 
     def _build_xy_panel(self) -> QWidget:
@@ -1098,6 +1127,48 @@ class DaqXYWindow(QMainWindow):
         form.addRow("Save", self.btn_positioner_apply)
         return box
 
+    def _build_compact_page(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("compactRoot")
+        layout = QGridLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(6)
+
+        compact_size = QSize(54, 48)
+        self.compact_btn_left = self._nav_button(
+            QStyle.StandardPixmap.SP_ArrowLeft, "Nudge left", compact_size
+        )
+        self.compact_btn_right = self._nav_button(
+            QStyle.StandardPixmap.SP_ArrowRight, "Nudge right", compact_size
+        )
+        self.compact_btn_up = self._nav_button(
+            QStyle.StandardPixmap.SP_ArrowUp, "Nudge up", compact_size
+        )
+        self.compact_btn_down = self._nav_button(
+            QStyle.StandardPixmap.SP_ArrowDown, "Nudge down", compact_size
+        )
+        self.btn_expand = QPushButton()
+        self.btn_expand.setObjectName("expandButton")
+        self.btn_expand.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarNormalButton))
+        self.btn_expand.setIconSize(QSize(18, 18))
+        self.btn_expand.setFixedSize(40, 36)
+        self.btn_expand.setToolTip("Return to the full DAQ controller (Esc)")
+        self.btn_expand.setAccessibleName("Return to full controller")
+
+        layout.addWidget(self.compact_btn_up, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_left, 1, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.btn_expand, 1, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_right, 1, 2, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_down, 2, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.setRowStretch(0, 1)
+        layout.setRowStretch(1, 1)
+        layout.setRowStretch(2, 1)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(2, 1)
+        return page
+
     def _build_mapping_panel(self) -> QWidget:
         map_box = QGroupBox("Device / Mapping")
         mf = QFormLayout(map_box)
@@ -1155,6 +1226,12 @@ class DaqXYWindow(QMainWindow):
         self.btn_right.clicked.connect(lambda: self._nudge_real(+STEP_PER_MOVE, 0.0))
         self.btn_up.clicked.connect(lambda: self._nudge_real(0.0, +STEP_PER_MOVE))
         self.btn_down.clicked.connect(lambda: self._nudge_real(0.0, -STEP_PER_MOVE))
+        self.compact_btn_left.clicked.connect(lambda: self._nudge_real(-STEP_PER_MOVE, 0.0))
+        self.compact_btn_right.clicked.connect(lambda: self._nudge_real(+STEP_PER_MOVE, 0.0))
+        self.compact_btn_up.clicked.connect(lambda: self._nudge_real(0.0, +STEP_PER_MOVE))
+        self.compact_btn_down.clicked.connect(lambda: self._nudge_real(0.0, -STEP_PER_MOVE))
+        self.btn_compact.clicked.connect(self._enter_compact_mode)
+        self.btn_expand.clicked.connect(self._exit_compact_mode)
         self.btn_rescan.clicked.connect(self._on_rescan_devices)
         self.cmb_device.currentTextChanged.connect(self._on_device_changed_pending)
         self.cmb_x_ch.currentTextChanged.connect(lambda _: self._update_mapping_dirty())
@@ -1186,6 +1263,113 @@ class DaqXYWindow(QMainWindow):
         self.btn_positioner_rescan.clicked.connect(self._rescan_positioner_ports)
         self.btn_positioner_apply.clicked.connect(self._on_apply_positioner_settings)
 
+    def _build_compact_shortcuts(self) -> None:
+        shortcut_actions = {
+            "up": ("Up", self.compact_btn_up.click),
+            "down": ("Down", self.compact_btn_down.click),
+            "left": ("Left", self.compact_btn_left.click),
+            "right": ("Right", self.compact_btn_right.click),
+            "exit": ("Esc", self._exit_compact_mode),
+        }
+        self._compact_shortcuts: dict[str, QShortcut] = {}
+        for name, (key, action) in shortcut_actions.items():
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(action)
+            shortcut.setEnabled(False)
+            self._compact_shortcuts[name] = shortcut
+
+    def _sync_compact_controls(self) -> None:
+        can_nudge = bool(self._enabled and not self._demo_reason)
+        for button in (
+            self.compact_btn_left,
+            self.compact_btn_right,
+            self.compact_btn_up,
+            self.compact_btn_down,
+        ):
+            button.setEnabled(can_nudge)
+        for name, shortcut in self._compact_shortcuts.items():
+            shortcut.setEnabled(bool(self._compact_mode and (name == "exit" or can_nudge)))
+
+    def _update_window_title(self) -> None:
+        if not self._compact_mode:
+            self.setWindowTitle(self._full_window_title)
+            return
+        if self._demo_reason:
+            state = "DEMO"
+        else:
+            state = "ON" if self._enabled else "OFF"
+        self.setWindowTitle(f"DAQ XY - {state}")
+
+    def _center_on_screen(self, screen: Any | None) -> None:
+        """Center this window on ``screen`` without maximizing it."""
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        frame_geometry = self.frameGeometry()
+        self.move(_centered_top_left(screen.availableGeometry(), frame_geometry.size()))
+
+    def _center_on_screen_after_frame_update(self, screen: Any | None) -> None:
+        """Center now and again after Qt finishes rebuilding the native frame."""
+        self._center_on_screen(screen)
+        QTimer.singleShot(0, lambda: self._center_on_screen(screen))
+
+    def _enter_compact_mode(self) -> None:
+        if self._compact_mode:
+            return
+        current_screen = self.screen()
+        if self.isMaximized() or self.isFullScreen():
+            self._full_window_geometry = self.normalGeometry()
+        else:
+            self._full_window_geometry = self.geometry()
+        self._full_window_flags = self.windowFlags()
+        self._full_window_minimum_size = self.minimumSize()
+        self._full_window_maximum_size = self.maximumSize()
+        was_visible = self.isVisible()
+
+        self._compact_mode = True
+        self._view_stack.setCurrentWidget(self._compact_page)
+        self._sync_compact_controls()
+        self._update_window_title()
+
+        _release_windows_native_window_icon(self)
+        # Keep this as a primary window so closing it still triggers Qt's normal
+        # last-window shutdown; Qt.Tool windows are excluded from that behavior.
+        compact_flags = self._full_window_flags | Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(compact_flags)
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        self.setFixedSize(190, 190)
+        if was_visible:
+            self.show()
+        self._center_on_screen_after_frame_update(current_screen)
+        _apply_window_icon(self)
+
+    def _exit_compact_mode(self) -> None:
+        if not self._compact_mode:
+            return
+        current_screen = self.screen()
+        was_visible = self.isVisible()
+        self._compact_mode = False
+        self._view_stack.setCurrentWidget(self._full_page)
+
+        _release_windows_native_window_icon(self)
+        if self._full_window_flags is not None:
+            self.setWindowFlags(self._full_window_flags)
+        if self._full_window_minimum_size is not None:
+            self.setMinimumSize(self._full_window_minimum_size)
+        if self._full_window_maximum_size is not None:
+            self.setMaximumSize(self._full_window_maximum_size)
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        if self._full_window_geometry is not None:
+            self.resize(self._full_window_geometry.size())
+        self._sync_compact_controls()
+        self._update_window_title()
+        if was_visible:
+            self.show()
+        self._center_on_screen_after_frame_update(current_screen)
+        _apply_window_icon(self)
+
     def _chip(self, text: str, state: str = "neutral") -> QLabel:
         label = QLabel(text)
         label.setObjectName("statusChip")
@@ -1204,12 +1388,14 @@ class DaqXYWindow(QMainWindow):
         label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         return label
 
-    def _nav_button(self, icon: QStyle.StandardPixmap, tooltip: str) -> QPushButton:
+    def _nav_button(
+        self, icon: QStyle.StandardPixmap, tooltip: str, size: QSize | None = None
+    ) -> QPushButton:
         btn = QPushButton()
         btn.setObjectName("navButton")
         btn.setIcon(self.style().standardIcon(icon))
         btn.setIconSize(QSize(22, 22))
-        btn.setFixedSize(46, 42)
+        btn.setFixedSize(size or QSize(46, 42))
         btn.setToolTip(tooltip)
         btn.setAccessibleName(tooltip)
         return btn
@@ -1221,6 +1407,10 @@ class DaqXYWindow(QMainWindow):
                 background: #f4f7f9;
                 color: #17202a;
                 font-size: 10pt;
+            }
+            QWidget#compactRoot {
+                background: #f4f7f9;
+                color: #17202a;
             }
             QFrame#commandBar, QFrame#bottomStatus {
                 background: #ffffff;
@@ -1355,6 +1545,10 @@ class DaqXYWindow(QMainWindow):
                 min-width: 42px;
                 min-height: 38px;
             }
+            QPushButton#expandButton {
+                padding: 0;
+                background: #e9eef5;
+            }
             QCheckBox {
                 spacing: 6px;
                 font-weight: 600;
@@ -1464,6 +1658,7 @@ class DaqXYWindow(QMainWindow):
         self.btn_right.setEnabled(enabled)
         self.btn_up.setEnabled(enabled)
         self.btn_down.setEnabled(enabled)
+        self._sync_compact_controls()
 
     def _populate_mapping_controls(self) -> None:
         self.cmb_device.blockSignals(True)
@@ -1735,6 +1930,8 @@ class DaqXYWindow(QMainWindow):
         self.lbl_hw_value.setText(f"Hardware\nX {self._vx:.3f} V / Y {self._vy:.3f} V")
 
     def _update_status(self) -> None:
+        self._sync_compact_controls()
+        self._update_window_title()
         if self._demo_reason:
             if hasattr(self, "lbl_output_chip"):
                 self._set_chip(self.lbl_output_chip, "OFF", "off")

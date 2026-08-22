@@ -8,6 +8,7 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 - Uses one bundled app icon for the Qt window and Windows taskbar identity.
 - Uses a modern console layout with status badges, a larger XY pad, and separated control/setup panels.
 - Optionally controls an ANC300 coarse XYZ positioner without affecting DAQ-only systems.
+- Includes a compact, always-on-top directional controller for working beside PowerPoint or other applications.
 
 ## Run the app
 ```bat
@@ -58,6 +59,19 @@ From repo root:
 python scripts\smoke_check.py
 python -m compileall .
 ```
+
+## Compact controller
+
+Click **Compact** in the full window to switch to a small, always-on-top controller. Enable
+**Output** before entering compact mode; the four directional buttons are intentionally
+disabled while output is off. Each click keeps the existing ramped `0.05 V` real-space
+nudge behavior.
+
+- Click the center restore button or press `Esc` to return to the full interface.
+- When the compact window has keyboard focus, the arrow keys nudge in the matching direction.
+- Switching views does not reconnect the DAQ or change the current output or target.
+- Closing the UI stops any unfinished ramp at its last actual position and does not ground,
+  home, or otherwise write new AO values. Reopening reads those existing outputs back.
 
 ## Expected folder structure
 

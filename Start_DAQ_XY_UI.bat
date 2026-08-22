@@ -38,7 +38,12 @@ echo [2/3] Installing/upgrading dependencies...
 
 echo [3/3] Launching DAQ XY UI (dev=%DEV% ao-x=%AOX% ao-y=%AOY%) ...
 ".venv\Scripts\python.exe" -m daq_xy_qt_readback --dev "%DEV%" --ao-x "%AOX%" --ao-y "%AOY%"
+set UI_EXIT_CODE=%ERRORLEVEL%
 
-echo.
-echo UI closed. Press any key to exit.
-pause >nul
+if not "%UI_EXIT_CODE%"=="0" (
+  echo.
+  echo DAQ XY UI exited with error code %UI_EXIT_CODE%. Press any key to close.
+  pause >nul
+)
+
+exit /b %UI_EXIT_CODE%
