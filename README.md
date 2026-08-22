@@ -7,6 +7,7 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 - Uses `iv_automation.DaqControl` with a real NI-DAQ device (no simulator fallback).
 - Uses one bundled app icon for the Qt window and Windows taskbar identity.
 - Uses a modern console layout with status badges, a larger XY pad, and separated control/setup panels.
+- Optionally controls an ANC300 coarse XYZ positioner without affecting DAQ-only systems.
 
 ## Run the app
 ```bat
@@ -71,6 +72,7 @@ daq_xy_qt_readback_repo/
       daq_xy_icon.ico
       daq_xy_icon.svg
     __main__.py
+    anc300_positioner.py
     daq_xy_qt_readback.py
   scripts/
     smoke_check.py
@@ -82,6 +84,18 @@ daq_xy_qt_readback_repo/
 
 For real hardware I/O, `iv_automation.py` must be importable in the same environment.
 If unavailable, app startup fails with a clear error.
+
+## Optional ANC300 positioner
+
+Positioner support is disabled by default and never opens a serial port automatically.
+In the **Setup** tab, enable the positioner for the current PC, select its COM port,
+assign unique ANC300 axes to X/Y/Z, and state which physical direction corresponds
+to each axis's positive command. Apply saves these settings in the current Windows
+user's application-data folder. Use the **Positioner** tab to connect explicitly and
+move using physical direction labels.
+
+Applying positioner settings sends no movement command. DAQ scanner operation remains
+available when the positioner is disabled, absent, or disconnected.
 
 ## Troubleshooting
 

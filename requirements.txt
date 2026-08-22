@@ -2,3 +2,4 @@ PyQt6>=6.5
 numpy
 nidaqmx
 pyvisa
+pyserial>=3.5

@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QApplication,
@@ -28,12 +28,21 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QSizePolicy,
     QSlider,
     QStyle,
     QTabWidget,
     QVBoxLayout,
     QWidget,
+)
+
+from .anc300_positioner import (
+    ANC300Positioner,
+    PositionerSettings,
+    list_serial_ports,
+    load_positioner_settings,
+    save_positioner_settings,
 )
 
 from .coordinate_transform import (
@@ -237,6 +246,12 @@ def _prefs_path() -> Path:
     data_dir = _default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir / "ui_mapping_settings.json"
+
+
+def _positioner_prefs_path() -> Path:
+    data_dir = _default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / "positioner_settings.json"
 
 
 @dataclass
@@ -691,8 +706,72 @@ class RampConfig:
     dwell_ms: int = 100
 
 
+class _PositionerWorker(QObject):
+    connected = pyqtSignal(str)
+    disconnected = pyqtSignal(str)
+    operation_started = pyqtSignal(str)
+    operation_finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    shutdown_finished = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._positioner = ANC300Positioner()
+
+    @pyqtSlot(object)
+    def connect_device(self, settings: object) -> None:
+        try:
+            assert isinstance(settings, PositionerSettings)
+            self.operation_started.emit("Connecting")
+            version = self._positioner.connect(settings)
+            self.connected.emit(version)
+            self.operation_finished.emit("Connected")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    @pyqtSlot()
+    def disconnect_device(self) -> None:
+        self._positioner.close()
+        self.disconnected.emit("Disconnected")
+
+    @pyqtSlot(object, str, str, int)
+    def move(self, settings: object, axis: str, direction: str, steps: int) -> None:
+        try:
+            assert isinstance(settings, PositionerSettings)
+            self.operation_started.emit(f"Moving {direction}")
+            self._positioner.move(settings, axis, direction, steps)
+            self.operation_finished.emit(f"Moved {direction} {steps} step(s)")
+        except Exception as exc:
+            self._positioner.close()
+            self.failed.emit(str(exc))
+
+    @pyqtSlot()
+    def stop_all(self) -> None:
+        try:
+            self.operation_started.emit("Stopping")
+            self._positioner.stop_all()
+            self.operation_finished.emit("STOP sent to all configured axes")
+        except Exception as exc:
+            self._positioner.close()
+            self.failed.emit(str(exc))
+
+    @pyqtSlot()
+    def shutdown(self) -> None:
+        self._positioner.close()
+        self.shutdown_finished.emit()
+        thread = self.thread()
+        if thread is not None:
+            thread.quit()
+
+
 class DaqXYWindow(QMainWindow):
     """Main UI keeping hardware outputs and real-space display separated."""
+
+    _positioner_connect_requested = pyqtSignal(object)
+    _positioner_disconnect_requested = pyqtSignal()
+    _positioner_move_requested = pyqtSignal(object, str, str, int)
+    _positioner_stop_requested = pyqtSignal()
+    _positioner_shutdown_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -727,6 +806,10 @@ class DaqXYWindow(QMainWindow):
         self._readback_status = ""
         self._vmin = V_MIN_DEFAULT
         self._vmax = V_MAX_DEFAULT
+        self._positioner_settings = load_positioner_settings(_positioner_prefs_path())
+        self._positioner_connected = False
+        self._positioner_busy = False
+        self._positioner_version = ""
 
         if demo_reason:
             self._daq: DaqInterface | DemoDaqInterface = DemoDaqInterface()
@@ -746,8 +829,28 @@ class DaqXYWindow(QMainWindow):
 
         self._build_ui()
         self._populate_mapping_controls()
+        self._populate_positioner_controls()
+        self._start_positioner_worker()
         self._sync_ui()
         self._apply_demo_mode_if_needed()
+
+    def _start_positioner_worker(self) -> None:
+        self._positioner_thread = QThread(self)
+        self._positioner_worker = _PositionerWorker()
+        self._positioner_worker.moveToThread(self._positioner_thread)
+        self._positioner_connect_requested.connect(self._positioner_worker.connect_device)
+        self._positioner_disconnect_requested.connect(self._positioner_worker.disconnect_device)
+        self._positioner_move_requested.connect(self._positioner_worker.move)
+        self._positioner_stop_requested.connect(self._positioner_worker.stop_all)
+        self._positioner_shutdown_requested.connect(self._positioner_worker.shutdown)
+        self._positioner_worker.connected.connect(self._on_positioner_connected)
+        self._positioner_worker.disconnected.connect(self._on_positioner_disconnected)
+        self._positioner_worker.operation_started.connect(self._on_positioner_operation_started)
+        self._positioner_worker.operation_finished.connect(self._on_positioner_operation_finished)
+        self._positioner_worker.failed.connect(self._on_positioner_failed)
+        self._positioner_worker.shutdown_finished.connect(self._positioner_thread.quit)
+        self._positioner_thread.finished.connect(self._positioner_worker.deleteLater)
+        self._positioner_thread.start()
 
     def _build_ui(self) -> None:
         self._apply_modern_style()
@@ -844,14 +947,23 @@ class DaqXYWindow(QMainWindow):
         control_layout.addWidget(self._build_nudge_panel())
         control_layout.addStretch(1)
 
+        positioner_page = QWidget()
+        positioner_layout = QVBoxLayout(positioner_page)
+        positioner_layout.setContentsMargins(0, 10, 0, 0)
+        positioner_layout.setSpacing(12)
+        positioner_layout.addWidget(self._build_positioner_control_panel())
+        positioner_layout.addStretch(1)
+
         setup_page = QWidget()
         setup_layout = QVBoxLayout(setup_page)
         setup_layout.setContentsMargins(0, 10, 0, 0)
         setup_layout.setSpacing(12)
         setup_layout.addWidget(self._build_mapping_panel())
+        setup_layout.addWidget(self._build_positioner_setup_panel())
         setup_layout.addStretch(1)
 
-        tabs.addTab(control_page, "Control")
+        tabs.addTab(control_page, "Scanner")
+        tabs.addTab(positioner_page, "Positioner")
         tabs.addTab(setup_page, "Setup")
         return tabs
 
@@ -896,6 +1008,95 @@ class DaqXYWindow(QMainWindow):
         ng.setColumnStretch(1, 1)
         ng.setColumnStretch(2, 1)
         return nudge_box
+
+    def _build_positioner_control_panel(self) -> QWidget:
+        box = QGroupBox("ANC300 Positioner")
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(14, 20, 14, 14)
+        layout.setSpacing(10)
+
+        connection = QHBoxLayout()
+        self.lbl_positioner_status = self._chip("Disconnected", "off")
+        self.btn_positioner_connect = QPushButton("Connect")
+        self.btn_positioner_connect.setProperty("role", "primary")
+        connection.addWidget(self.lbl_positioner_status, 1)
+        connection.addWidget(self.btn_positioner_connect)
+        layout.addLayout(connection)
+
+        self.lbl_positioner_mapping = QLabel("")
+        self.lbl_positioner_mapping.setWordWrap(True)
+        layout.addWidget(self.lbl_positioner_mapping)
+
+        step_row = QHBoxLayout()
+        step_row.addWidget(QLabel("Step count"))
+        self.spn_positioner_steps = QSpinBox()
+        self.spn_positioner_steps.setRange(1, 1000)
+        self.spn_positioner_steps.setValue(10)
+        step_row.addWidget(self.spn_positioner_steps, 1)
+        layout.addLayout(step_row)
+
+        xy = QGridLayout()
+        self.btn_pos_left = QPushButton("← Left")
+        self.btn_pos_right = QPushButton("Right →")
+        self.btn_pos_up = QPushButton("↑ Up")
+        self.btn_pos_down = QPushButton("↓ Down")
+        xy.addWidget(self.btn_pos_up, 0, 1)
+        xy.addWidget(self.btn_pos_left, 1, 0)
+        xy.addWidget(self.btn_pos_right, 1, 2)
+        xy.addWidget(self.btn_pos_down, 2, 1)
+        layout.addLayout(xy)
+
+        z_row = QHBoxLayout()
+        self.btn_pos_away = QPushButton("Away from sample")
+        self.btn_pos_toward = QPushButton("Toward sample")
+        self.btn_pos_toward.setProperty("role", "danger")
+        z_row.addWidget(self.btn_pos_away)
+        z_row.addWidget(self.btn_pos_toward)
+        layout.addLayout(z_row)
+
+        self.btn_positioner_stop = QPushButton("STOP ALL")
+        self.btn_positioner_stop.setProperty("role", "danger")
+        layout.addWidget(self.btn_positioner_stop)
+        return box
+
+    def _build_positioner_setup_panel(self) -> QWidget:
+        box = QGroupBox("ANC300 Positioner Setup")
+        form = QFormLayout(box)
+        form.setContentsMargins(14, 20, 14, 14)
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        self.chk_positioner_enabled = QCheckBox("Enable positioner on this PC")
+        self.cmb_positioner_port = QComboBox()
+        self.cmb_positioner_port.setEditable(True)
+        self.btn_positioner_rescan = QPushButton("Rescan")
+        self.btn_positioner_rescan.setProperty("role", "secondary")
+        self.cmb_pos_x_axis = QComboBox()
+        self.cmb_pos_y_axis = QComboBox()
+        self.cmb_pos_z_axis = QComboBox()
+        for combo in (self.cmb_pos_x_axis, self.cmb_pos_y_axis, self.cmb_pos_z_axis):
+            combo.addItems([str(axis) for axis in range(1, 8)])
+        self.cmb_pos_x_positive = QComboBox()
+        self.cmb_pos_x_positive.addItem("Left", "left")
+        self.cmb_pos_x_positive.addItem("Right", "right")
+        self.cmb_pos_y_positive = QComboBox()
+        self.cmb_pos_y_positive.addItem("Up", "up")
+        self.cmb_pos_y_positive.addItem("Down", "down")
+        self.cmb_pos_z_positive = QComboBox()
+        self.cmb_pos_z_positive.addItem("Toward sample", "toward")
+        self.cmb_pos_z_positive.addItem("Away from sample", "away")
+        self.lbl_positioner_setup_state = self._chip("Saved", "ok")
+        self.btn_positioner_apply = QPushButton("Apply")
+        self.btn_positioner_apply.setProperty("role", "primary")
+
+        form.addRow("Use positioner", self.chk_positioner_enabled)
+        form.addRow("COM port", self._hbox(self.cmb_positioner_port, self.btn_positioner_rescan))
+        form.addRow("X axis / + direction", self._hbox(self.cmb_pos_x_axis, self.cmb_pos_x_positive))
+        form.addRow("Y axis / + direction", self._hbox(self.cmb_pos_y_axis, self.cmb_pos_y_positive))
+        form.addRow("Z axis / + direction", self._hbox(self.cmb_pos_z_axis, self.cmb_pos_z_positive))
+        form.addRow("State", self.lbl_positioner_setup_state)
+        form.addRow("Save", self.btn_positioner_apply)
+        return box
 
     def _build_mapping_panel(self) -> QWidget:
         map_box = QGroupBox("Device / Mapping")
@@ -963,6 +1164,27 @@ class DaqXYWindow(QMainWindow):
         self.chk_rot_en.toggled.connect(self._on_rotation_enabled_changed)
         self.spn_rot_deg.valueChanged.connect(lambda _: self._update_mapping_dirty())
         self.btn_apply.clicked.connect(self._on_apply_mapping)
+        self.btn_positioner_connect.clicked.connect(self._on_positioner_connect_clicked)
+        self.btn_positioner_stop.clicked.connect(self._on_positioner_stop_clicked)
+        self.btn_pos_left.clicked.connect(lambda: self._request_positioner_move("x", "left"))
+        self.btn_pos_right.clicked.connect(lambda: self._request_positioner_move("x", "right"))
+        self.btn_pos_up.clicked.connect(lambda: self._request_positioner_move("y", "up"))
+        self.btn_pos_down.clicked.connect(lambda: self._request_positioner_move("y", "down"))
+        self.btn_pos_toward.clicked.connect(lambda: self._request_positioner_move("z", "toward"))
+        self.btn_pos_away.clicked.connect(lambda: self._request_positioner_move("z", "away"))
+        self.chk_positioner_enabled.toggled.connect(lambda _: self._update_positioner_setup_dirty())
+        self.cmb_positioner_port.currentTextChanged.connect(lambda _: self._update_positioner_setup_dirty())
+        for combo in (
+            self.cmb_pos_x_axis,
+            self.cmb_pos_y_axis,
+            self.cmb_pos_z_axis,
+            self.cmb_pos_x_positive,
+            self.cmb_pos_y_positive,
+            self.cmb_pos_z_positive,
+        ):
+            combo.currentIndexChanged.connect(lambda _: self._update_positioner_setup_dirty())
+        self.btn_positioner_rescan.clicked.connect(self._rescan_positioner_ports)
+        self.btn_positioner_apply.clicked.connect(self._on_apply_positioner_settings)
 
     def _chip(self, text: str, state: str = "neutral") -> QLabel:
         label = QLabel(text)
@@ -1164,14 +1386,14 @@ class DaqXYWindow(QMainWindow):
                 background: #ffffff;
                 border: 2px solid #0284c7;
             }
-            QComboBox, QDoubleSpinBox {
+            QComboBox, QDoubleSpinBox, QSpinBox {
                 background: #ffffff;
                 border: 1px solid #cbd5e1;
                 border-radius: 6px;
                 padding: 5px 7px;
                 min-height: 24px;
             }
-            QComboBox:focus, QDoubleSpinBox:focus {
+            QComboBox:focus, QDoubleSpinBox:focus, QSpinBox:focus {
                 border-color: #0284c7;
             }
             """
@@ -1259,6 +1481,199 @@ class DaqXYWindow(QMainWindow):
         self.pad.set_voltage_range(self._vmin, self._vmax, self._vmin, self._vmax)
         self._update_pad_projection()
         self._update_mapping_dirty()
+
+    def _populate_positioner_controls(self) -> None:
+        settings = self._positioner_settings
+        widgets = (
+            self.chk_positioner_enabled,
+            self.cmb_positioner_port,
+            self.cmb_pos_x_axis,
+            self.cmb_pos_y_axis,
+            self.cmb_pos_z_axis,
+            self.cmb_pos_x_positive,
+            self.cmb_pos_y_positive,
+            self.cmb_pos_z_positive,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.chk_positioner_enabled.setChecked(settings.enabled)
+        self._rescan_positioner_ports(update_state=False)
+        if settings.port:
+            if self.cmb_positioner_port.findText(settings.port) < 0:
+                self.cmb_positioner_port.addItem(settings.port)
+            self.cmb_positioner_port.setCurrentText(settings.port)
+        self.cmb_pos_x_axis.setCurrentText(str(settings.x_axis))
+        self.cmb_pos_y_axis.setCurrentText(str(settings.y_axis))
+        self.cmb_pos_z_axis.setCurrentText(str(settings.z_axis))
+        self.cmb_pos_x_positive.setCurrentIndex(self.cmb_pos_x_positive.findData(settings.x_positive))
+        self.cmb_pos_y_positive.setCurrentIndex(self.cmb_pos_y_positive.findData(settings.y_positive))
+        self.cmb_pos_z_positive.setCurrentIndex(self.cmb_pos_z_positive.findData(settings.z_positive))
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._update_positioner_setup_dirty()
+        self._update_positioner_controls()
+
+    def _positioner_settings_from_controls(self) -> PositionerSettings:
+        return PositionerSettings(
+            enabled=self.chk_positioner_enabled.isChecked(),
+            port=self.cmb_positioner_port.currentText().strip(),
+            baudrate=38400,
+            x_axis=int(self.cmb_pos_x_axis.currentText()),
+            y_axis=int(self.cmb_pos_y_axis.currentText()),
+            z_axis=int(self.cmb_pos_z_axis.currentText()),
+            x_positive=str(self.cmb_pos_x_positive.currentData()),
+            y_positive=str(self.cmb_pos_y_positive.currentData()),
+            z_positive=str(self.cmb_pos_z_positive.currentData()),
+        )
+
+    def _update_positioner_setup_dirty(self) -> None:
+        if not hasattr(self, "btn_positioner_apply"):
+            return
+        candidate = self._positioner_settings_from_controls()
+        dirty = candidate != self._positioner_settings
+        try:
+            candidate.validate()
+            valid = True
+        except ValueError:
+            valid = False
+        self.btn_positioner_apply.setEnabled(dirty and valid)
+        if not valid:
+            self._set_chip(self.lbl_positioner_setup_state, "Invalid", "warning")
+        elif dirty:
+            self._set_chip(self.lbl_positioner_setup_state, "Pending", "warning")
+        else:
+            self._set_chip(self.lbl_positioner_setup_state, "Saved", "ok")
+
+    def _rescan_positioner_ports(self, _checked: bool = False, update_state: bool = True) -> None:
+        current = self.cmb_positioner_port.currentText().strip()
+        ports = list_serial_ports()
+        self.cmb_positioner_port.blockSignals(True)
+        self.cmb_positioner_port.clear()
+        self.cmb_positioner_port.addItems(ports)
+        if current:
+            if self.cmb_positioner_port.findText(current) < 0:
+                self.cmb_positioner_port.addItem(current)
+            self.cmb_positioner_port.setCurrentText(current)
+        self.cmb_positioner_port.blockSignals(False)
+        if update_state:
+            self._update_positioner_setup_dirty()
+
+    def _on_apply_positioner_settings(self) -> None:
+        candidate = self._positioner_settings_from_controls()
+        try:
+            candidate.validate()
+            save_positioner_settings(_positioner_prefs_path(), candidate)
+        except Exception as exc:
+            QMessageBox.warning(self, "Positioner Setup", f"Unable to save positioner settings: {exc}")
+            return
+        if self._positioner_connected and candidate != self._positioner_settings:
+            self._positioner_busy = True
+            self._positioner_disconnect_requested.emit()
+            self._positioner_connected = False
+        self._positioner_settings = candidate
+        self._update_positioner_setup_dirty()
+        self._update_positioner_controls("Settings saved. Connect explicitly when ready.")
+
+    def _update_positioner_controls(self, detail: str = "") -> None:
+        if not hasattr(self, "btn_positioner_connect"):
+            return
+        settings = self._positioner_settings
+        enabled = settings.enabled
+        motion_enabled = enabled and self._positioner_connected and not self._positioner_busy
+        for button in (
+            self.btn_pos_left,
+            self.btn_pos_right,
+            self.btn_pos_up,
+            self.btn_pos_down,
+            self.btn_pos_toward,
+            self.btn_pos_away,
+        ):
+            button.setEnabled(motion_enabled)
+        self.spn_positioner_steps.setEnabled(motion_enabled)
+        self.btn_positioner_stop.setEnabled(enabled and self._positioner_connected)
+        self.btn_positioner_connect.setEnabled(enabled and not self._positioner_busy)
+        self.btn_positioner_connect.setText("Disconnect" if self._positioner_connected else "Connect")
+        if not enabled:
+            self._set_chip(self.lbl_positioner_status, "Not configured", "off")
+        elif self._positioner_connected:
+            self._set_chip(
+                self.lbl_positioner_status,
+                "Busy" if self._positioner_busy else "Connected",
+                "warning" if self._positioner_busy else "ok",
+            )
+        else:
+            self._set_chip(self.lbl_positioner_status, "Disconnected", "off")
+        self.lbl_positioner_mapping.setText(
+            f"{settings.port or 'No COM port'} | "
+            f"X={settings.x_axis} (+ is {settings.x_positive}) | "
+            f"Y={settings.y_axis} (+ is {settings.y_positive}) | "
+            f"Z={settings.z_axis} (+ is {settings.z_positive} sample)"
+            + (f"\n{detail}" if detail else "")
+        )
+
+    def _on_positioner_connect_clicked(self) -> None:
+        if self._positioner_connected:
+            self._positioner_busy = True
+            self._update_positioner_controls("Disconnecting…")
+            self._positioner_disconnect_requested.emit()
+            return
+        try:
+            self._positioner_settings.validate()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Positioner", str(exc))
+            return
+        self._positioner_busy = True
+        self._update_positioner_controls("Connecting without sending movement commands…")
+        self._positioner_connect_requested.emit(self._positioner_settings)
+
+    def _request_positioner_move(self, axis: str, direction: str) -> None:
+        if not self._positioner_connected or self._positioner_busy:
+            return
+        steps = int(self.spn_positioner_steps.value())
+        if axis == "z" and steps > 100:
+            QMessageBox.warning(self, "Positioner Z Limit", "Z moves are limited to 100 steps per command.")
+            return
+        self._positioner_busy = True
+        self._update_positioner_controls(f"Moving {direction}…")
+        self._positioner_move_requested.emit(self._positioner_settings, axis, direction, steps)
+
+    def _on_positioner_stop_clicked(self) -> None:
+        if self._positioner_connected:
+            self._positioner_busy = True
+            self._update_positioner_controls("Stopping…")
+            self._positioner_stop_requested.emit()
+
+    @pyqtSlot(str)
+    def _on_positioner_connected(self, version: str) -> None:
+        self._positioner_connected = True
+        self._positioner_busy = False
+        self._positioner_version = version
+        self._update_positioner_controls("ANC300 identity and stepping modes verified.")
+
+    @pyqtSlot(str)
+    def _on_positioner_disconnected(self, reason: str) -> None:
+        self._positioner_connected = False
+        self._positioner_busy = False
+        self._positioner_version = ""
+        self._update_positioner_controls(reason)
+
+    @pyqtSlot(str)
+    def _on_positioner_operation_started(self, operation: str) -> None:
+        self._positioner_busy = True
+        self._update_positioner_controls(operation + "…")
+
+    @pyqtSlot(str)
+    def _on_positioner_operation_finished(self, detail: str) -> None:
+        self._positioner_busy = False
+        self._update_positioner_controls(detail)
+
+    @pyqtSlot(str)
+    def _on_positioner_failed(self, message: str) -> None:
+        self._positioner_connected = False
+        self._positioner_busy = False
+        self._update_positioner_controls(f"Error: {message}")
+        if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() != "offscreen":
+            QMessageBox.warning(self, "ANC300 Positioner", message)
 
     def _update_pad_projection(self) -> None:
         poly = reachable_real_polygon(self._mapping)
@@ -1596,6 +2011,10 @@ class DaqXYWindow(QMainWindow):
     def closeEvent(self, e: Any) -> None:  # type: ignore[override]
         try:
             self._ramp_timer.stop()
+            if hasattr(self, "_positioner_thread") and self._positioner_thread.isRunning():
+                self._positioner_shutdown_requested.emit()
+                if not self._positioner_thread.wait(8000):
+                    LOGGER.warning("Positioner worker did not stop before the UI closed.")
             LOGGER.info("Closing scanner UI without altering current AO outputs.")
             self._daq.close()
         finally:

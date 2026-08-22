@@ -13,6 +13,7 @@ dependencies = [
     "numpy",
     "nidaqmx",
     "pyvisa",
+    "pyserial>=3.5",
 ]
 
 [project.scripts]

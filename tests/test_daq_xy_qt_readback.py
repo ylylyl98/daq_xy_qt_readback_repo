@@ -154,9 +154,16 @@ class WindowSafetyTests(unittest.TestCase):
         FakeDaqControl.fail_readback = False
         self._patcher = mock.patch.object(ui_mod, "_RealDaqControl", FakeDaqControl)
         self._patcher.start()
+        self._positioner_patcher = mock.patch.object(
+            ui_mod,
+            "load_positioner_settings",
+            return_value=ui_mod.PositionerSettings(enabled=False),
+        )
+        self._positioner_patcher.start()
         self.app = QApplication.instance() or QApplication([])
 
     def tearDown(self) -> None:
+        self._positioner_patcher.stop()
         self._patcher.stop()
 
     def test_window_initializes_from_existing_hardware_outputs(self) -> None:
@@ -174,6 +181,9 @@ class WindowSafetyTests(unittest.TestCase):
             self.assertAlmostEqual(win._vy, 1.25)
             self.assertIn("readback=measured", win.lbl_status.text())
             self.assertEqual(win._daq._daq.write_calls, [])
+            self.assertTrue(win.chk_enable.isEnabled())
+            self.assertFalse(win.btn_positioner_connect.isEnabled())
+            self.assertEqual(win.lbl_positioner_status.text(), "Not configured")
         finally:
             win.close()
 
