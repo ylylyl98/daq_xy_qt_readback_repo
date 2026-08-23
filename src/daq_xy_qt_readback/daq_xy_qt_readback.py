@@ -12,8 +12,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
-from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -45,6 +45,15 @@ from .anc300_positioner import (
     load_positioner_settings,
     save_positioner_settings,
 )
+from ._version import __version__
+from .update_checker import (
+    ReleaseInfo,
+    UpdatePreferences,
+    fetch_latest_release,
+    is_newer_release,
+    load_update_preferences,
+    save_update_preferences,
+)
 
 from .coordinate_transform import (
     MappingSettings,
@@ -60,7 +69,9 @@ STEP_PER_MOVE = 0.05
 LOGGER = logging.getLogger(__name__)
 APP_DISPLAY_NAME = "DAQ XY Control"
 APP_USER_MODEL_ID = "daq_xy_qt_readback.DAQXYControl"
+APP_MUTEX_NAME = "DAQXYControl.Application.8E67D61C"
 _ASSET_FILES = ExitStack()
+_WINDOWS_APP_MUTEX_HANDLE: Any | None = None
 V_MIN_DEFAULT = 0.0
 V_MAX_DEFAULT = 10.0
 
@@ -112,6 +123,23 @@ def _set_windows_app_user_model_id() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(ctypes.c_wchar_p(APP_USER_MODEL_ID))
     except Exception as exc:
         LOGGER.debug("Unable to set Windows AppUserModelID: %s", exc)
+
+
+def _create_windows_app_mutex() -> None:
+    """Expose a process-lifetime mutex so the installer will not update a running app."""
+    global _WINDOWS_APP_MUTEX_HANDLE
+    if sys.platform != "win32" or _WINDOWS_APP_MUTEX_HANDLE is not None:
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        handle = kernel32.CreateMutexW(None, False, APP_MUTEX_NAME)
+        if handle:
+            _WINDOWS_APP_MUTEX_HANDLE = handle
+    except Exception as exc:
+        LOGGER.debug("Unable to create installer coordination mutex: %s", exc)
 
 
 def _set_windows_native_window_icon(window: QWidget) -> None:
@@ -199,9 +227,11 @@ def _apply_window_icon(window: QWidget) -> None:
 
 def _configure_application(app: QApplication) -> None:
     _set_windows_app_user_model_id()
+    _create_windows_app_mutex()
     app.setOrganizationName("Instrument Control")
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
+    app.setApplicationVersion(__version__)
     app.setDesktopFileName(APP_USER_MODEL_ID)
     icon = _load_app_icon()
     if not icon.isNull():
@@ -261,6 +291,12 @@ def _positioner_prefs_path() -> Path:
     data_dir = _default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir / "positioner_settings.json"
+
+
+def _update_prefs_path() -> Path:
+    data_dir = _default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir / "update_settings.json"
 
 
 @dataclass
@@ -773,6 +809,22 @@ class _PositionerWorker(QObject):
             thread.quit()
 
 
+class _UpdateWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    @pyqtSlot()
+    def check(self) -> None:
+        try:
+            self.finished.emit(fetch_latest_release())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            thread = self.thread()
+            if thread is not None:
+                thread.quit()
+
+
 class DaqXYWindow(QMainWindow):
     """Main UI keeping hardware outputs and real-space display separated."""
 
@@ -820,6 +872,11 @@ class DaqXYWindow(QMainWindow):
         self._positioner_connected = False
         self._positioner_busy = False
         self._positioner_version = ""
+        self._update_preferences = load_update_preferences(_update_prefs_path())
+        self._available_release: ReleaseInfo | None = None
+        self._update_check_manual = False
+        self._update_thread: QThread | None = None
+        self._update_worker: _UpdateWorker | None = None
         self._compact_mode = False
         self._full_window_geometry: Any | None = None
         self._full_window_flags: Any | None = None
@@ -848,6 +905,8 @@ class DaqXYWindow(QMainWindow):
         self._start_positioner_worker()
         self._sync_ui()
         self._apply_demo_mode_if_needed()
+        if self._automatic_update_checks_enabled() and not self._update_preferences.checked_recently():
+            QTimer.singleShot(2000, self._start_automatic_update_check)
 
     def _start_positioner_worker(self) -> None:
         self._positioner_thread = QThread(self)
@@ -880,6 +939,7 @@ class DaqXYWindow(QMainWindow):
         root.setSpacing(14)
 
         root.addWidget(self._build_command_bar())
+        root.addWidget(self._build_update_banner())
 
         workspace = QHBoxLayout()
         workspace.setSpacing(14)
@@ -937,11 +997,37 @@ class DaqXYWindow(QMainWindow):
         self.btn_compact = QPushButton("Compact")
         self.btn_compact.setToolTip("Show only the directional controller and keep it above other windows.")
         self.btn_compact.setProperty("role", "secondary")
+        self.btn_about = QPushButton("About")
+        self.btn_about.setToolTip("Show the installed version and check for updates.")
+        self.btn_about.setProperty("role", "secondary")
         layout.addWidget(self.chk_enable)
         layout.addWidget(self.btn_home)
         layout.addWidget(self.btn_ground)
         layout.addWidget(self.btn_compact)
+        layout.addWidget(self.btn_about)
         return bar
+
+    def _build_update_banner(self) -> QWidget:
+        banner = QFrame()
+        banner.setObjectName("updateBanner")
+        layout = QHBoxLayout(banner)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(8)
+        self.lbl_update_available = QLabel("")
+        self.lbl_update_available.setWordWrap(True)
+        self.btn_view_update = QPushButton("View update")
+        self.btn_view_update.setProperty("role", "primary")
+        self.btn_update_later = QPushButton("Later")
+        self.btn_update_later.setProperty("role", "secondary")
+        self.btn_skip_update = QPushButton("Skip this version")
+        self.btn_skip_update.setProperty("role", "secondary")
+        layout.addWidget(self.lbl_update_available, 1)
+        layout.addWidget(self.btn_view_update)
+        layout.addWidget(self.btn_update_later)
+        layout.addWidget(self.btn_skip_update)
+        banner.setVisible(False)
+        self.update_banner = banner
+        return banner
 
     def _build_xy_panel(self) -> QWidget:
         panel = QGroupBox("XY Position")
@@ -1232,6 +1318,10 @@ class DaqXYWindow(QMainWindow):
         self.compact_btn_down.clicked.connect(lambda: self._nudge_real(0.0, -STEP_PER_MOVE))
         self.btn_compact.clicked.connect(self._enter_compact_mode)
         self.btn_expand.clicked.connect(self._exit_compact_mode)
+        self.btn_about.clicked.connect(self._show_about_dialog)
+        self.btn_view_update.clicked.connect(self._open_available_release)
+        self.btn_update_later.clicked.connect(lambda: self.update_banner.hide())
+        self.btn_skip_update.clicked.connect(self._skip_available_release)
         self.btn_rescan.clicked.connect(self._on_rescan_devices)
         self.cmb_device.currentTextChanged.connect(self._on_device_changed_pending)
         self.cmb_x_ch.currentTextChanged.connect(lambda _: self._update_mapping_dirty())
@@ -1262,6 +1352,126 @@ class DaqXYWindow(QMainWindow):
             combo.currentIndexChanged.connect(lambda _: self._update_positioner_setup_dirty())
         self.btn_positioner_rescan.clicked.connect(self._rescan_positioner_ports)
         self.btn_positioner_apply.clicked.connect(self._on_apply_positioner_settings)
+
+    def _automatic_update_checks_enabled(self) -> bool:
+        disabled = os.environ.get("DAQ_XY_DISABLE_UPDATE_CHECK", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        offscreen = os.environ.get("QT_QPA_PLATFORM", "").strip().lower() == "offscreen"
+        return not disabled and not offscreen
+
+    def _start_automatic_update_check(self) -> None:
+        self._start_update_check(manual=False)
+
+    def _start_update_check(self, *, manual: bool) -> None:
+        if self._update_thread is not None and self._update_thread.isRunning():
+            if manual:
+                QMessageBox.information(self, "Check for Updates", "An update check is already in progress.")
+            return
+        self._update_check_manual = manual
+        thread = QThread(self)
+        worker = _UpdateWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.check)
+        worker.finished.connect(self._on_update_check_finished)
+        worker.failed.connect(self._on_update_check_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_update_thread_finished)
+        self._update_thread = thread
+        self._update_worker = worker
+        thread.start()
+
+    @pyqtSlot()
+    def _on_update_thread_finished(self) -> None:
+        thread = self._update_thread
+        self._update_thread = None
+        self._update_worker = None
+        if thread is not None:
+            thread.deleteLater()
+
+    def _record_update_check_attempt(self) -> None:
+        self._update_preferences.mark_checked()
+        try:
+            save_update_preferences(_update_prefs_path(), self._update_preferences)
+        except Exception:
+            LOGGER.debug("Unable to save update-check preferences.", exc_info=True)
+
+    @pyqtSlot(object)
+    def _on_update_check_finished(self, release: object) -> None:
+        manual = self._update_check_manual
+        self._record_update_check_attempt()
+        if not isinstance(release, ReleaseInfo):
+            self._on_update_check_failed("The update service returned an invalid response.")
+            return
+        if not is_newer_release(__version__, release.version):
+            self._available_release = None
+            self.update_banner.hide()
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Check for Updates",
+                    f"DAQ XY Control {__version__} is the latest available version.",
+                )
+            return
+        if release.version == self._update_preferences.skipped_version and not manual:
+            return
+        self._available_release = release
+        notes = " ".join(release.notes.split())
+        if len(notes) > 220:
+            notes = notes[:217].rstrip() + "…"
+        message = f"DAQ XY Control {release.version} is available."
+        if notes:
+            message += f" {notes}"
+        self.lbl_update_available.setText(message)
+        self.update_banner.show()
+
+    @pyqtSlot(str)
+    def _on_update_check_failed(self, message: str) -> None:
+        manual = self._update_check_manual
+        self._record_update_check_attempt()
+        LOGGER.info("Update check unavailable: %s", message)
+        if manual:
+            QMessageBox.warning(
+                self,
+                "Check for Updates",
+                "Unable to check for updates right now. Hardware control is unaffected.\n\n" + message,
+            )
+
+    def _show_about_dialog(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("About DAQ XY Control")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(f"DAQ XY Control {__version__}")
+        box.setInformativeText(
+            "Fine scanner control through NI-DAQ with optional ANC300 coarse positioning.\n\n"
+            "Update checks do not connect to or command either hardware subsystem."
+        )
+        check_button = box.addButton("Check for updates", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is check_button:
+            self._start_update_check(manual=True)
+
+    def _open_available_release(self) -> None:
+        release = self._available_release
+        if release is not None:
+            QDesktopServices.openUrl(QUrl(release.page_url))
+
+    def _skip_available_release(self) -> None:
+        release = self._available_release
+        if release is None:
+            return
+        self._update_preferences.skipped_version = release.version
+        try:
+            save_update_preferences(_update_prefs_path(), self._update_preferences)
+        except Exception:
+            LOGGER.debug("Unable to save skipped update version.", exc_info=True)
+        self.update_banner.hide()
 
     def _build_compact_shortcuts(self) -> None:
         shortcut_actions = {
@@ -1415,6 +1625,11 @@ class DaqXYWindow(QMainWindow):
             QFrame#commandBar, QFrame#bottomStatus {
                 background: #ffffff;
                 border: 1px solid #d7dee8;
+                border-radius: 8px;
+            }
+            QFrame#updateBanner {
+                background: #eff6ff;
+                border: 1px solid #93c5fd;
                 border-radius: 8px;
             }
             QLabel#appTitle {
@@ -2208,6 +2423,10 @@ class DaqXYWindow(QMainWindow):
     def closeEvent(self, e: Any) -> None:  # type: ignore[override]
         try:
             self._ramp_timer.stop()
+            if self._update_thread is not None and self._update_thread.isRunning():
+                self._update_thread.quit()
+                if not self._update_thread.wait(6000):
+                    LOGGER.warning("Update-check worker did not stop before the UI closed.")
             if hasattr(self, "_positioner_thread") and self._positioner_thread.isRunning():
                 self._positioner_shutdown_requested.emit()
                 if not self._positioner_thread.wait(8000):
