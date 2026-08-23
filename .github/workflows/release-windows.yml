@@ -58,12 +58,12 @@ jobs:
         run: |
           $exe = "dist\DAQ XY Control\DAQ XY Control.exe"
           if (-not (Test-Path -LiteralPath $exe)) { throw "Packaged executable was not created" }
-          & $exe --version
-          if ($LASTEXITCODE -ne 0) { throw "Packaged executable version check failed" }
-          & $exe --packaged-backend-check
-          if ($LASTEXITCODE -ne 0) { throw "Packaged DAQ backend import check failed" }
-          & $exe --packaged-smoke-test
-          if ($LASTEXITCODE -ne 0) { throw "Packaged UI smoke test failed" }
+          $versionCheck = Start-Process -FilePath $exe -ArgumentList "--version" -Wait -PassThru
+          if ($versionCheck.ExitCode -ne 0) { throw "Packaged executable version check failed" }
+          $backendCheck = Start-Process -FilePath $exe -ArgumentList "--packaged-backend-check" -Wait -PassThru
+          if ($backendCheck.ExitCode -ne 0) { throw "Packaged DAQ backend import check failed" }
+          $uiCheck = Start-Process -FilePath $exe -ArgumentList "--packaged-smoke-test" -Wait -PassThru
+          if ($uiCheck.ExitCode -ne 0) { throw "Packaged UI smoke test failed" }
 
       - name: Create portable archive and checksums
         shell: pwsh
