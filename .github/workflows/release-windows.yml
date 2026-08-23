@@ -1,0 +1,105 @@
+name: Release Windows installer
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      DAQ_XY_DISABLE_UPDATE_CHECK: "1"
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install application and build tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller
+
+      - name: Verify tag matches application version
+        shell: pwsh
+        run: |
+          $version = python -c "from daq_xy_qt_readback import __version__; print(__version__)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match application version $version"
+          }
+
+      - name: Run tests and source smoke check
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests
+          python scripts/smoke_check.py
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build application and installer
+        shell: pwsh
+        run: python scripts/build_windows.py --installer --expected-version "${{ github.ref_name }}"
+
+      - name: Verify packaged executable metadata path
+        shell: pwsh
+        run: |
+          $exe = "dist\DAQ XY Control\DAQ XY Control.exe"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Packaged executable was not created" }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "Packaged executable version check failed" }
+          & $exe --packaged-backend-check
+          if ($LASTEXITCODE -ne 0) { throw "Packaged DAQ backend import check failed" }
+          & $exe --packaged-smoke-test
+          if ($LASTEXITCODE -ne 0) { throw "Packaged UI smoke test failed" }
+
+      - name: Create portable archive and checksums
+        shell: pwsh
+        run: |
+          $version = python -c "from daq_xy_qt_readback import __version__; print(__version__)"
+          $zip = "dist\DAQ-XY-Control-Portable-$version.zip"
+          Compress-Archive -LiteralPath "dist\DAQ XY Control" -DestinationPath $zip
+          $installer = "dist\installer\DAQ-XY-Control-Setup-$version.exe"
+          $assets = @($installer, $zip)
+          $lines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($asset))"
+          }
+          $lines | Set-Content -Encoding ascii "dist\SHA256SUMS.txt"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DAQ-XY-Control-${{ github.ref_name }}
+          path: |
+            dist/installer/*.exe
+            dist/DAQ-XY-Control-Portable-*.zip
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Get-ChildItem -LiteralPath "dist\installer" -Filter "*.exe" | Select-Object -First 1
+          $portable = Get-ChildItem -LiteralPath "dist" -Filter "DAQ-XY-Control-Portable-*.zip" | Select-Object -First 1
+          if (-not $installer -or -not $portable) { throw "Release assets are missing" }
+          gh release create "${{ github.ref_name }}" `
+            $installer.FullName `
+            $portable.FullName `
+            dist/SHA256SUMS.txt `
+            --verify-tag `
+            --generate-notes `
+            --title "DAQ XY Control ${{ github.ref_name }}"

@@ -11,6 +11,21 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 - Includes a compact, always-on-top directional controller for working beside PowerPoint or other applications.
 
 ## Run the app
+
+### Install a released version
+
+Download `DAQ-XY-Control-Setup-<version>.exe` from the repository's GitHub Releases
+page and run it. The installer includes Python, PyQt, and the application packages;
+users do not need to install Python. Vendor hardware drivers, including NI-DAQmx,
+remain separate prerequisites.
+
+The installed app checks for a newer stable GitHub Release in the background no more
+than once per day. Update failures are silent and never affect hardware control. Use
+**About → Check for updates** for a manual check. Updates are installed by closing the
+app and running the newer installer; scanner and positioner settings are preserved.
+
+### Run from source
+
 ```bat
 git clone https://github.com/ylylyl98/daq_xy_qt_readback_repo.git
 ```
@@ -60,6 +75,26 @@ python scripts\smoke_check.py
 python -m compileall .
 ```
 
+## Build a Windows release
+
+The reproducible packaging files are under `packaging/windows`. On Windows, install
+the project and PyInstaller, then build the one-folder application:
+
+```powershell
+python -m pip install . pyinstaller
+python scripts/build_windows.py
+```
+
+With Inno Setup 6 installed, build the installer too:
+
+```powershell
+python scripts/build_windows.py --installer
+```
+
+Detailed versioning, test, signing, and release instructions are in
+[`docs/RELEASING.md`](docs/RELEASING.md). Pushing a matching version tag starts the
+GitHub Actions Windows release workflow.
+
 ## Compact controller
 
 Click **Compact** in the full window to switch to a small, always-on-top controller. Enable
@@ -88,6 +123,11 @@ daq_xy_qt_readback_repo/
     __main__.py
     anc300_positioner.py
     daq_xy_qt_readback.py
+    update_checker.py
+    _version.py
+  packaging/windows/
+    daq_xy_control.spec
+    daq_xy_control.iss
   scripts/
     smoke_check.py
   requirements.txt

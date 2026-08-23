@@ -3,3 +3,4 @@ numpy
 nidaqmx
 pyvisa
 pyserial>=3.5
+packaging>=24
