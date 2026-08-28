@@ -757,6 +757,7 @@ class _PositionerWorker(QObject):
     operation_started = pyqtSignal(str)
     operation_finished = pyqtSignal(str)
     failed = pyqtSignal(str)
+    disconnect_failed = pyqtSignal(str)
     shutdown_finished = pyqtSignal()
 
     def __init__(self) -> None:
@@ -776,8 +777,11 @@ class _PositionerWorker(QObject):
 
     @pyqtSlot()
     def disconnect_device(self) -> None:
-        self._positioner.close()
-        self.disconnected.emit("Disconnected")
+        try:
+            self._positioner.close()
+            self.disconnected.emit("Disconnected — serial port released")
+        except Exception as exc:
+            self.disconnect_failed.emit(str(exc))
 
     @pyqtSlot(object, str, str, int)
     def move(self, settings: object, axis: str, direction: str, steps: int) -> None:
@@ -802,11 +806,15 @@ class _PositionerWorker(QObject):
 
     @pyqtSlot()
     def shutdown(self) -> None:
-        self._positioner.close()
-        self.shutdown_finished.emit()
-        thread = self.thread()
-        if thread is not None:
-            thread.quit()
+        try:
+            self._positioner.close()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.shutdown_finished.emit()
+            thread = self.thread()
+            if thread is not None:
+                thread.quit()
 
 
 class _UpdateWorker(QObject):
@@ -922,6 +930,7 @@ class DaqXYWindow(QMainWindow):
         self._positioner_worker.operation_started.connect(self._on_positioner_operation_started)
         self._positioner_worker.operation_finished.connect(self._on_positioner_operation_finished)
         self._positioner_worker.failed.connect(self._on_positioner_failed)
+        self._positioner_worker.disconnect_failed.connect(self._on_positioner_disconnect_failed)
         self._positioner_worker.shutdown_finished.connect(self._positioner_thread.quit)
         self._positioner_thread.finished.connect(self._positioner_worker.deleteLater)
         self._positioner_thread.start()
@@ -1216,7 +1225,30 @@ class DaqXYWindow(QMainWindow):
     def _build_compact_page(self) -> QWidget:
         page = QWidget()
         page.setObjectName("compactRoot")
-        layout = QGridLayout(page)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
+
+        header = QHBoxLayout()
+        self.compact_lbl_mode = QLabel("Fine scanner")
+        self.compact_lbl_mode.setObjectName("appTitle")
+        header.addWidget(self.compact_lbl_mode, 1)
+        self.btn_expand = QPushButton()
+        self.btn_expand.setObjectName("expandButton")
+        self.btn_expand.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarNormalButton))
+        self.btn_expand.setIconSize(QSize(18, 18))
+        self.btn_expand.setFixedSize(40, 36)
+        self.btn_expand.setToolTip("Return to the full controller (Esc)")
+        self.btn_expand.setAccessibleName("Return to full controller")
+        header.addWidget(self.btn_expand)
+        outer.addLayout(header)
+
+        self.compact_tabs = QTabWidget()
+        self.compact_tabs.setObjectName("compactModeTabs")
+        outer.addWidget(self.compact_tabs, 1)
+
+        scanner_page = QWidget()
+        layout = QGridLayout(scanner_page)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setHorizontalSpacing(6)
         layout.setVerticalSpacing(6)
@@ -1234,25 +1266,63 @@ class DaqXYWindow(QMainWindow):
         self.compact_btn_down = self._nav_button(
             QStyle.StandardPixmap.SP_ArrowDown, "Nudge down", compact_size
         )
-        self.btn_expand = QPushButton()
-        self.btn_expand.setObjectName("expandButton")
-        self.btn_expand.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarNormalButton))
-        self.btn_expand.setIconSize(QSize(18, 18))
-        self.btn_expand.setFixedSize(40, 36)
-        self.btn_expand.setToolTip("Return to the full DAQ controller (Esc)")
-        self.btn_expand.setAccessibleName("Return to full controller")
+        self.compact_lbl_scanner_state = self._chip("Scanner OFF", "off")
 
-        layout.addWidget(self.compact_btn_up, 0, 1, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.compact_btn_left, 1, 0, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.btn_expand, 1, 1, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.compact_btn_right, 1, 2, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.compact_btn_down, 2, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_lbl_scanner_state, 0, 0, 1, 3)
+        layout.addWidget(self.compact_btn_up, 1, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_left, 2, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_right, 2, 2, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_down, 3, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(QLabel(f"Nudge {STEP_PER_MOVE:.2f} V"), 4, 0, 1, 3, Qt.AlignmentFlag.AlignCenter)
         layout.setRowStretch(0, 1)
         layout.setRowStretch(1, 1)
         layout.setRowStretch(2, 1)
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(2, 1)
+        self.compact_tabs.addTab(scanner_page, "Scanner")
+
+        positioner_page = QWidget()
+        positioner_layout = QVBoxLayout(positioner_page)
+        positioner_layout.setContentsMargins(8, 8, 8, 8)
+        positioner_layout.setSpacing(6)
+        connection = QHBoxLayout()
+        self.compact_lbl_positioner_status = self._chip("Not configured", "off")
+        self.compact_btn_positioner_connect = QPushButton("Connect")
+        connection.addWidget(self.compact_lbl_positioner_status, 1)
+        connection.addWidget(self.compact_btn_positioner_connect)
+        positioner_layout.addLayout(connection)
+
+        step_row = QHBoxLayout()
+        step_row.addWidget(QLabel("Steps"))
+        self.compact_spn_positioner_steps = QSpinBox()
+        self.compact_spn_positioner_steps.setRange(1, 1000)
+        self.compact_spn_positioner_steps.setValue(10)
+        step_row.addWidget(self.compact_spn_positioner_steps, 1)
+        positioner_layout.addLayout(step_row)
+
+        pos_xy = QGridLayout()
+        self.compact_btn_pos_left = QPushButton("← Left")
+        self.compact_btn_pos_right = QPushButton("Right →")
+        self.compact_btn_pos_up = QPushButton("↑ Up")
+        self.compact_btn_pos_down = QPushButton("↓ Down")
+        pos_xy.addWidget(self.compact_btn_pos_up, 0, 1)
+        pos_xy.addWidget(self.compact_btn_pos_left, 1, 0)
+        pos_xy.addWidget(self.compact_btn_pos_right, 1, 2)
+        pos_xy.addWidget(self.compact_btn_pos_down, 2, 1)
+        positioner_layout.addLayout(pos_xy)
+
+        pos_z = QHBoxLayout()
+        self.compact_btn_pos_away = QPushButton("Away")
+        self.compact_btn_pos_toward = QPushButton("Toward")
+        self.compact_btn_pos_toward.setProperty("role", "danger")
+        pos_z.addWidget(self.compact_btn_pos_away)
+        pos_z.addWidget(self.compact_btn_pos_toward)
+        positioner_layout.addLayout(pos_z)
+        self.compact_btn_positioner_stop = QPushButton("STOP ALL")
+        self.compact_btn_positioner_stop.setProperty("role", "danger")
+        positioner_layout.addWidget(self.compact_btn_positioner_stop)
+        self.compact_tabs.addTab(positioner_page, "Positioner")
         return page
 
     def _build_mapping_panel(self) -> QWidget:
@@ -1316,6 +1386,17 @@ class DaqXYWindow(QMainWindow):
         self.compact_btn_right.clicked.connect(lambda: self._nudge_real(+STEP_PER_MOVE, 0.0))
         self.compact_btn_up.clicked.connect(lambda: self._nudge_real(0.0, +STEP_PER_MOVE))
         self.compact_btn_down.clicked.connect(lambda: self._nudge_real(0.0, -STEP_PER_MOVE))
+        self.compact_tabs.currentChanged.connect(self._on_compact_mode_changed)
+        self.compact_btn_positioner_connect.clicked.connect(self._on_positioner_connect_clicked)
+        self.compact_spn_positioner_steps.valueChanged.connect(self.spn_positioner_steps.setValue)
+        self.spn_positioner_steps.valueChanged.connect(self.compact_spn_positioner_steps.setValue)
+        self.compact_btn_pos_left.clicked.connect(lambda: self._request_positioner_move("x", "left"))
+        self.compact_btn_pos_right.clicked.connect(lambda: self._request_positioner_move("x", "right"))
+        self.compact_btn_pos_up.clicked.connect(lambda: self._request_positioner_move("y", "up"))
+        self.compact_btn_pos_down.clicked.connect(lambda: self._request_positioner_move("y", "down"))
+        self.compact_btn_pos_toward.clicked.connect(lambda: self._request_positioner_move("z", "toward"))
+        self.compact_btn_pos_away.clicked.connect(lambda: self._request_positioner_move("z", "away"))
+        self.compact_btn_positioner_stop.clicked.connect(self._on_positioner_stop_clicked)
         self.btn_compact.clicked.connect(self._enter_compact_mode)
         self.btn_expand.clicked.connect(self._exit_compact_mode)
         self.btn_about.clicked.connect(self._show_about_dialog)
@@ -1475,10 +1556,10 @@ class DaqXYWindow(QMainWindow):
 
     def _build_compact_shortcuts(self) -> None:
         shortcut_actions = {
-            "up": ("Up", self.compact_btn_up.click),
-            "down": ("Down", self.compact_btn_down.click),
-            "left": ("Left", self.compact_btn_left.click),
-            "right": ("Right", self.compact_btn_right.click),
+            "up": ("Up", lambda: self._compact_arrow("up")),
+            "down": ("Down", lambda: self._compact_arrow("down")),
+            "left": ("Left", lambda: self._compact_arrow("left")),
+            "right": ("Right", lambda: self._compact_arrow("right")),
             "exit": ("Esc", self._exit_compact_mode),
         }
         self._compact_shortcuts: dict[str, QShortcut] = {}
@@ -1498,8 +1579,34 @@ class DaqXYWindow(QMainWindow):
             self.compact_btn_down,
         ):
             button.setEnabled(can_nudge)
+        self._set_chip(
+            self.compact_lbl_scanner_state,
+            "Scanner ON" if can_nudge else "Scanner OFF",
+            "ok" if can_nudge else "off",
+        )
+        positioner_motion = bool(
+            self._positioner_settings.enabled and self._positioner_connected and not self._positioner_busy
+        )
+        active_motion = positioner_motion if self.compact_tabs.currentIndex() == 1 else can_nudge
         for name, shortcut in self._compact_shortcuts.items():
-            shortcut.setEnabled(bool(self._compact_mode and (name == "exit" or can_nudge)))
+            shortcut.setEnabled(bool(self._compact_mode and (name == "exit" or active_motion)))
+
+    def _on_compact_mode_changed(self, index: int) -> None:
+        self.compact_lbl_mode.setText("Coarse positioner" if index == 1 else "Fine scanner")
+        self._sync_compact_controls()
+
+    def _compact_arrow(self, direction: str) -> None:
+        if self.compact_tabs.currentIndex() == 1:
+            axis = "x" if direction in {"left", "right"} else "y"
+            self._request_positioner_move(axis, direction)
+            return
+        scanner_moves = {
+            "left": (-STEP_PER_MOVE, 0.0),
+            "right": (+STEP_PER_MOVE, 0.0),
+            "up": (0.0, +STEP_PER_MOVE),
+            "down": (0.0, -STEP_PER_MOVE),
+        }
+        self._nudge_real(*scanner_moves[direction])
 
     def _update_window_title(self) -> None:
         if not self._compact_mode:
@@ -1549,7 +1656,7 @@ class DaqXYWindow(QMainWindow):
         compact_flags = self._full_window_flags | Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(compact_flags)
         self.setWindowState(Qt.WindowState.WindowNoState)
-        self.setFixedSize(190, 190)
+        self.setFixedSize(300, 360)
         if was_visible:
             self.show()
         self._center_on_screen_after_frame_update(current_screen)
@@ -2020,6 +2127,34 @@ class DaqXYWindow(QMainWindow):
             f"Z={settings.z_axis} (+ is {settings.z_positive} sample)"
             + (f"\n{detail}" if detail else "")
         )
+        if hasattr(self, "compact_lbl_positioner_status"):
+            compact_buttons = (
+                self.compact_btn_pos_left,
+                self.compact_btn_pos_right,
+                self.compact_btn_pos_up,
+                self.compact_btn_pos_down,
+                self.compact_btn_pos_toward,
+                self.compact_btn_pos_away,
+            )
+            for button in compact_buttons:
+                button.setEnabled(motion_enabled)
+            self.compact_spn_positioner_steps.setEnabled(motion_enabled)
+            self.compact_btn_positioner_stop.setEnabled(enabled and self._positioner_connected)
+            self.compact_btn_positioner_connect.setEnabled(enabled and not self._positioner_busy)
+            self.compact_btn_positioner_connect.setText(
+                "Disconnect" if self._positioner_connected else "Connect"
+            )
+            if not enabled:
+                self._set_chip(self.compact_lbl_positioner_status, "Not configured", "off")
+            elif self._positioner_connected:
+                self._set_chip(
+                    self.compact_lbl_positioner_status,
+                    "Busy" if self._positioner_busy else "Connected",
+                    "warning" if self._positioner_busy else "ok",
+                )
+            else:
+                self._set_chip(self.compact_lbl_positioner_status, "Disconnected", "off")
+            self._sync_compact_controls()
 
     def _on_positioner_connect_clicked(self) -> None:
         if self._positioner_connected:
@@ -2066,6 +2201,14 @@ class DaqXYWindow(QMainWindow):
         self._positioner_busy = False
         self._positioner_version = ""
         self._update_positioner_controls(reason)
+
+    @pyqtSlot(str)
+    def _on_positioner_disconnect_failed(self, message: str) -> None:
+        self._positioner_connected = True
+        self._positioner_busy = False
+        self._update_positioner_controls(f"Disconnect failed: {message}")
+        if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() != "offscreen":
+            QMessageBox.warning(self, "ANC300 Positioner", message)
 
     @pyqtSlot(str)
     def _on_positioner_operation_started(self, operation: str) -> None:
