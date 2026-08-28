@@ -183,13 +183,19 @@ class ANC300Positioner:
             raise RuntimeError("; ".join(errors))
 
     def close(self) -> None:
-        serial_port, self._serial = self._serial, None
+        serial_port = self._serial
         self._axes = ()
-        if serial_port is not None:
-            try:
-                serial_port.close()
-            except Exception:
-                pass
+        if serial_port is None:
+            return
+        try:
+            serial_port.close()
+        except Exception as exc:
+            if not getattr(serial_port, "is_open", True):
+                self._serial = None
+            raise RuntimeError("Unable to release the ANC300 serial port.") from exc
+        if getattr(serial_port, "is_open", False):
+            raise RuntimeError("The ANC300 serial port remained open after disconnecting.")
+        self._serial = None
 
     def _exchange(self, command: str) -> str:
         if not self.connected:

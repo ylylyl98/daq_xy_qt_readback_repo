@@ -50,6 +50,16 @@ class FakeSerial:
         self.is_open = False
 
 
+class StuckOpenSerial(FakeSerial):
+    def close(self) -> None:
+        pass
+
+
+class FailingCloseSerial(FakeSerial):
+    def close(self) -> None:
+        raise OSError("port close failed")
+
+
 class PositionerMappingTests(unittest.TestCase):
     def test_physical_directions_map_through_user_choices(self) -> None:
         settings = PositionerSettings(
@@ -109,6 +119,24 @@ class ANC300ProtocolTests(unittest.TestCase):
         before = list(self.serial.writes)
         self.positioner.close()
         self.assertEqual(self.serial.writes, before)
+
+    def test_close_rejects_a_port_that_remains_open(self) -> None:
+        serial_port = StuckOpenSerial()
+        positioner = ANC300Positioner(serial_factory=lambda **_: serial_port)
+        positioner.connect(self.settings)
+
+        with self.assertRaisesRegex(RuntimeError, "remained open"):
+            positioner.close()
+        self.assertTrue(positioner.connected)
+
+    def test_close_reports_driver_failure_and_keeps_open_handle(self) -> None:
+        serial_port = FailingCloseSerial()
+        positioner = ANC300Positioner(serial_factory=lambda **_: serial_port)
+        positioner.connect(self.settings)
+
+        with self.assertRaisesRegex(RuntimeError, "Unable to release"):
+            positioner.close()
+        self.assertTrue(positioner.connected)
 
 
 if __name__ == "__main__":

@@ -316,7 +316,7 @@ class WindowSafetyTests(unittest.TestCase):
 
             self.assertTrue(win._compact_mode)
             self.assertIs(win._view_stack.currentWidget(), win._compact_page)
-            self.assertEqual(win.size(), ui_mod.QSize(190, 190))
+            self.assertEqual(win.size(), ui_mod.QSize(300, 360))
             screen_center = win.screen().availableGeometry().center()
             compact_center = win.frameGeometry().center()
             self.assertLessEqual(abs(compact_center.x() - screen_center.x()), 3)
@@ -428,6 +428,60 @@ class WindowSafetyTests(unittest.TestCase):
             )
             self.assertTrue(all(not button.isEnabled() for button in buttons))
             self.assertTrue(win.btn_expand.isEnabled())
+            self.assertEqual(win._daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_compact_positioner_is_safe_when_not_configured(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._enter_compact_mode()
+            win.compact_tabs.setCurrentIndex(1)
+            self.app.processEvents()
+
+            self.assertEqual(win.compact_lbl_positioner_status.text(), "Not configured")
+            self.assertFalse(win.compact_btn_positioner_connect.isEnabled())
+            self.assertFalse(win.compact_btn_pos_left.isEnabled())
+            self.assertFalse(win.compact_btn_pos_toward.isEnabled())
+            self.assertFalse(win.compact_btn_positioner_stop.isEnabled())
+            self.assertEqual(win._daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_compact_positioner_buttons_emit_mapped_move(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._positioner_settings = ui_mod.PositionerSettings(enabled=True, port="COM4")
+            win._positioner_connected = True
+            win._update_positioner_controls()
+            win._enter_compact_mode()
+            win.compact_tabs.setCurrentIndex(1)
+            win.compact_spn_positioner_steps.setValue(17)
+            emitted: list[tuple[object, str, str, int]] = []
+            win._positioner_move_requested.connect(
+                lambda settings, axis, direction, steps: emitted.append((settings, axis, direction, steps))
+            )
+
+            win.compact_btn_pos_left.click()
+
+            self.assertEqual(emitted[-1][1:], ("x", "left", 17))
+            self.assertTrue(win._positioner_busy)
             self.assertEqual(win._daq._daq.write_calls, [])
         finally:
             win.close()
