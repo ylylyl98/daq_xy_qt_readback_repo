@@ -205,6 +205,67 @@ class WindowSafetyTests(unittest.TestCase):
         finally:
             win.close()
 
+    def test_scanner_ground_waits_for_three_near_zero_readbacks(self) -> None:
+        FakeDaqControl.initial_outputs = {"ao0": 0.008, "ao1": -0.006}
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._positioner_settings = ui_mod.PositionerSettings(
+                enabled=True,
+                port="COM4",
+                scanner_zero_tolerance_v=0.01,
+            )
+            win._positioner_connected = True
+            requests: list[object] = []
+            win._scanner_ground_requested.connect(requests.append)
+
+            win._begin_scanner_transition("ground")
+            win._ramp_step()
+            self.assertEqual(win._daq._daq.write_calls[-1], (0.0, 0.0))
+            win._ramp_step()
+            win._ramp_step()
+            self.assertEqual(requests, [])
+            win._ramp_step()
+
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(win._scanner_state, "GROUNDING")
+        finally:
+            win.close()
+
+    def test_scanner_ground_is_withheld_when_readback_is_uncertain(self) -> None:
+        FakeDaqControl.initial_outputs = {"ao0": 0.0, "ao1": 0.0}
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._positioner_settings = ui_mod.PositionerSettings(enabled=True, port="COM4")
+            win._positioner_connected = True
+            win._readback_uncertain = True
+            win._daq._daq.fail_readback = True
+            requests: list[object] = []
+            win._scanner_ground_requested.connect(requests.append)
+
+            win._begin_scanner_transition("ground")
+            win._ramp_step()
+
+            self.assertEqual(requests, [])
+            self.assertEqual(win._scanner_state, "FAULT")
+        finally:
+            win.close()
+
     def test_apply_mapping_save_failure_keeps_outputs_unchanged_and_ramp_stopped(self) -> None:
         win = ui_mod.DaqXYWindow(
             dev_name="Dev1",
@@ -217,6 +278,7 @@ class WindowSafetyTests(unittest.TestCase):
         )
         try:
             old_daq = win._daq
+            win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win._set_target_hw(9.0, 2.5)
             self.assertTrue(win._ramp_timer.isActive())
@@ -250,6 +312,7 @@ class WindowSafetyTests(unittest.TestCase):
         )
         try:
             old_daq = win._daq
+            win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win._set_target_hw(9.0, 2.5)
             self.assertTrue(win._ramp_timer.isActive())
@@ -281,6 +344,7 @@ class WindowSafetyTests(unittest.TestCase):
             channels_by_device={"Dev1": ["ao0", "ao1"]},
             demo_reason=None,
         )
+        win._scanner_state = "READY"
         win.chk_enable.setChecked(True)
         win._set_target_hw(9.0, 2.5)
         self.assertTrue(win._ramp_timer.isActive())
@@ -308,6 +372,7 @@ class WindowSafetyTests(unittest.TestCase):
             win.show()
             self.app.processEvents()
             full_geometry = win.geometry()
+            win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             original_target = (win._target_rx, win._target_ry)
 
@@ -316,7 +381,7 @@ class WindowSafetyTests(unittest.TestCase):
 
             self.assertTrue(win._compact_mode)
             self.assertIs(win._view_stack.currentWidget(), win._compact_page)
-            self.assertEqual(win.size(), ui_mod.QSize(300, 360))
+            self.assertEqual(win.size(), win._compact_size_for_tab(0))
             screen_center = win.screen().availableGeometry().center()
             compact_center = win.frameGeometry().center()
             self.assertLessEqual(abs(compact_center.x() - screen_center.x()), 3)
@@ -355,6 +420,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win._enter_compact_mode()
             start_x, start_y = win._target_rx, win._target_ry
@@ -469,6 +535,7 @@ class WindowSafetyTests(unittest.TestCase):
         try:
             win._positioner_settings = ui_mod.PositionerSettings(enabled=True, port="COM4")
             win._positioner_connected = True
+            win._positioner_ready = True
             win._update_positioner_controls()
             win._enter_compact_mode()
             win.compact_tabs.setCurrentIndex(1)
@@ -486,6 +553,53 @@ class WindowSafetyTests(unittest.TestCase):
         finally:
             win.close()
 
+    def test_compact_positioner_controls_are_not_cropped(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win.show()
+            win._enter_compact_mode()
+            win.compact_tabs.setCurrentIndex(1)
+            self.app.processEvents()
+
+            self.assertEqual(win.size(), win._compact_size_for_tab(1))
+            controls = (
+                win.compact_btn_pos_left,
+                win.compact_btn_pos_right,
+                win.compact_btn_pos_up,
+                win.compact_btn_pos_down,
+                win.compact_btn_pos_away,
+                win.compact_btn_pos_toward,
+                win.compact_btn_positioner_stop,
+                win.compact_btn_positioner_ground,
+                win.compact_btn_positioner_enable,
+            )
+            page_rect = win._compact_page.rect()
+            for button in controls:
+                self.assertTrue(button.isVisible())
+                self.assertGreaterEqual(button.height(), 38)
+                top_left = button.mapTo(win._compact_page, QPoint(0, 0))
+                bottom_right = button.mapTo(
+                    win._compact_page,
+                    QPoint(button.width() - 1, button.height() - 1),
+                )
+                self.assertTrue(page_rect.contains(top_left))
+                self.assertTrue(page_rect.contains(bottom_right))
+
+            self.assertEqual(
+                win.compact_btn_positioner_ground.geometry().y(),
+                win.compact_btn_positioner_enable.geometry().y(),
+            )
+        finally:
+            win.close()
+
     def test_compact_arrow_key_nudges_and_escape_restores_full_view(self) -> None:
         win = ui_mod.DaqXYWindow(
             dev_name="Dev1",
@@ -497,6 +611,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win.show()
             win._enter_compact_mode()

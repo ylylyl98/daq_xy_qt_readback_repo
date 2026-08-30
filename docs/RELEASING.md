@@ -21,10 +21,10 @@ application itself does not require administrator access. Settings remain under
 Update it before creating a release:
 
 ```python
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 ```
 
-The Git tag must match exactly with a leading `v`, for example `v1.1.0`. The release
+The Git tag must match exactly with a leading `v`, for example `v1.2.0`. The release
 workflow rejects mismatched tags.
 
 ## Local validation
@@ -54,8 +54,8 @@ computer. Confirm that no port is opened and no hardware output changes on start
 After merging the release changes to `main`:
 
 ```powershell
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 The `Release Windows installer` workflow tests the source, builds the packaged app,

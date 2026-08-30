@@ -23,6 +23,7 @@ class FakeSerial:
         self.is_open = True
         self.writes: list[str] = []
         self._responses: list[bytes] = []
+        self.modes: dict[str, str] = {}
 
     def reset_input_buffer(self) -> None:
         pass
@@ -33,7 +34,12 @@ class FakeSerial:
         if command == "ver":
             body = "attocube ANC300 test firmware"
         elif command.startswith("getm "):
-            body = "stp"
+            axis = command.split()[1]
+            body = self.modes.get(axis, "stp")
+        elif command.startswith("setm "):
+            _, axis, mode = command.split()
+            self.modes[axis] = mode
+            body = "OK"
         else:
             body = "OK"
         self._responses = [f"{command}\r\n".encode(), f"{body}\r\n".encode()]
@@ -82,8 +88,25 @@ class PositionerMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different"):
             settings.validate()
 
+    def test_scanner_and_positioner_axes_cannot_overlap(self) -> None:
+        settings = PositionerSettings(
+            enabled=True,
+            port="COM4",
+            scanner_x_axis=1,
+            scanner_y_axis=4,
+            x_axis=4,
+            y_axis=5,
+            z_axis=6,
+        )
+        with self.assertRaisesRegex(ValueError, "different ANC300 axes"):
+            settings.validate()
+
+    def test_zero_tolerance_has_safe_bounds(self) -> None:
+        with self.assertRaisesRegex(ValueError, "zero tolerance"):
+            PositionerSettings(scanner_zero_tolerance_v=0.0001).validate()
+
     def test_settings_round_trip(self) -> None:
-        settings = PositionerSettings(enabled=True, port="COM7", x_axis=2, y_axis=3, z_axis=7)
+        settings = PositionerSettings(enabled=True, port="COM7", x_axis=4, y_axis=5, z_axis=7)
         with tempfile.TemporaryDirectory() as folder:
             path = pathlib.Path(folder) / "positioner_settings.json"
             save_positioner_settings(path, settings)
@@ -106,8 +129,57 @@ class ANC300ProtocolTests(unittest.TestCase):
         self.positioner.move(self.settings, "x", "left", 10)
         self.positioner.move(self.settings, "x", "right", 11)
         self.positioner.move(self.settings, "z", "away", 5)
-        self.assertEqual(self.serial.writes[-3:], ["stepu 4 10", "stepd 4 11", "stepd 6 5"])
+        self.assertEqual(
+            self.serial.writes[-6:],
+            ["getm 4", "stepu 4 10", "getm 4", "stepd 4 11", "getm 6", "stepd 6 5"],
+        )
         self.assertFalse(any(" 1 " in command or " 2 " in command or " 3 " in command for command in self.serial.writes))
+
+    def test_ground_all_uses_anc300_ground_mode(self) -> None:
+        self.positioner.connect(self.settings)
+        detail = self.positioner.ground_all()
+        self.assertEqual(
+            self.serial.writes[-9:],
+            [
+                "stop 4", "setm 4 gnd", "getm 4",
+                "stop 5", "setm 5 gnd", "getm 5",
+                "stop 6", "setm 6 gnd", "getm 6",
+            ],
+        )
+        self.assertEqual(detail, "Grounded ANC300 axes: 4, 5, 6")
+
+    def test_grounded_positioner_cannot_move_until_explicitly_enabled(self) -> None:
+        self.positioner.connect(self.settings)
+        self.positioner.ground_all()
+        before = list(self.serial.writes)
+        with self.assertRaisesRegex(RuntimeError, "not enabled for stepping"):
+            self.positioner.move(self.settings, "x", "left", 10)
+        self.assertEqual(self.serial.writes[len(before):], ["getm 4"])
+
+    def test_enable_all_uses_anc300_stepping_mode(self) -> None:
+        self.positioner.connect(self.settings)
+        self.positioner.ground_all()
+        detail = self.positioner.enable_all()
+        self.assertEqual(
+            self.serial.writes[-6:],
+            ["setm 4 stp", "getm 4", "setm 5 stp", "getm 5", "setm 6 stp", "getm 6"],
+        )
+        self.assertEqual(detail, "Enabled ANC300 stepping on axes: 4, 5, 6")
+
+    def test_scanner_mode_commands_only_use_scanner_axes(self) -> None:
+        self.positioner.connect(self.settings)
+        ground_detail = self.positioner.ground_scanner(self.settings)
+        self.assertEqual(
+            self.serial.writes[-4:],
+            ["setm 1 gnd", "getm 1", "setm 2 gnd", "getm 2"],
+        )
+        enable_detail = self.positioner.enable_scanner(self.settings)
+        self.assertEqual(
+            self.serial.writes[-4:],
+            ["setm 1 stp", "getm 1", "setm 2 stp", "getm 2"],
+        )
+        self.assertEqual(ground_detail, "Grounded ANC300 scanner axes: 1, 2")
+        self.assertEqual(enable_detail, "Enabled ANC300 scanner axes: 1, 2")
 
     def test_z_single_move_limit_is_enforced(self) -> None:
         self.positioner.connect(self.settings)

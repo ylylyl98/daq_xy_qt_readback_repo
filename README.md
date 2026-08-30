@@ -14,10 +14,12 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 
 ### Install a released version
 
-Download `DAQ-XY-Control-Setup-<version>.exe` from the repository's GitHub Releases
-page and run it. The installer includes Python, PyQt, and the application packages;
+[Download DAQ XY Control 1.2.0 for Windows](https://github.com/ylylyl98/daq_xy_qt_readback_repo/releases/latest/download/DAQ-XY-Control-Setup-1.2.0.exe)
+
+Run the downloaded installer. It includes Python, PyQt, and the application packages;
 users do not need to install Python. Vendor hardware drivers, including NI-DAQmx,
-remain separate prerequisites.
+remain separate prerequisites. The [GitHub Releases page](https://github.com/ylylyl98/daq_xy_qt_readback_repo/releases/latest)
+also provides a portable ZIP and SHA-256 checksums.
 
 The installed app checks for a newer stable GitHub Release in the background no more
 than once per day. Update failures are silent and never affect hardware control. Use
@@ -97,16 +99,16 @@ GitHub Actions Windows release workflow.
 
 ## Compact controller
 
-Click **Compact** in the full window to switch to a small, always-on-top controller. Enable
-**Output** before entering compact mode; the four directional buttons are intentionally
-disabled while output is off. Each click keeps the existing ramped `0.05 V` real-space
-nudge behavior.
+Click **Compact** in the full window to switch to a small, always-on-top controller.
+Use **Enable Scanner** to complete the verified DAQ-near-zero and ANC300 stepping-mode
+sequence; directional controls remain disabled until the scanner reaches READY. Each
+click keeps the existing ramped `0.05 V` real-space nudge behavior.
 
 - Click the center restore button or press `Esc` to return to the full interface.
 - When the compact window has keyboard focus, the arrow keys nudge in the matching direction.
 - Switching views does not reconnect the DAQ or change the current output or target.
-- Closing the UI stops any unfinished ramp at its last actual position and does not ground,
-  home, or otherwise write new AO values. Reopening reads those existing outputs back.
+- When active hardware is detected during close, the UI offers a safe shutdown sequence
+  that ramps the DAQ to near zero before grounding the mapped ANC300 axes.
 
 ## Expected folder structure
 
@@ -150,6 +152,28 @@ move using physical direction labels.
 
 Applying positioner settings sends no movement command. DAQ scanner operation remains
 available when the positioner is disabled, absent, or disconnected.
+
+After connecting, use **GROUND POSITIONER** in the **Positioner** tab to send the ANC300
+`setm <axis> gnd` command to all configured axes. This disables their outputs and
+connects them to chassis ground. Use **ENABLE POSITIONER** to explicitly return the
+configured positioner axes to stepping mode before issuing movement commands.
+
+The positioner controls are separate from the scanner controls. Configure the ANC300
+scanner X/Y axes separately in Setup (defaults: axes 1/2). **Scanner → Ground** first
+ramps DAQ AO0/AO1 to 0 V, then grounds only those mapped ANC300 scanner axes.
+**Positioner → Ground Positioner** controls only the configured ANC300 positioner axes.
+
+The scanner is treated as one combined DAQ + ANC300 instrument. **Enable Scanner**
+first verifies several consecutive DAQ readbacks inside the configured near-zero
+tolerance, then enables ANC300 stepping. **Safe Ground Scanner** locks movement,
+ramps the DAQ command toward 0 V, waits for three stable near-zero readbacks, and only
+then sends and verifies ANC300 GND mode. Readback uncertainty or any failed check
+blocks the ANC300 mode change. The default tolerance is ±0.010 V and is configurable
+in Setup.
+
+Positioner motion requires an explicit **Enable Positioner** action. Grounding sends
+STOP before switching each configured positioner axis to GND; movement never silently
+re-enables a grounded positioner axis.
 
 ## Troubleshooting
 
