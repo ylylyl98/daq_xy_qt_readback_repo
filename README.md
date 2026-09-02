@@ -5,6 +5,7 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 - Output transitions are ramped (no instant jumps).
 - Includes `Home` and `Ground (ramp to 0 V)` actions.
 - Uses `iv_automation.DaqControl` with a real NI-DAQ device (no simulator fallback).
+- Opens with the NI-DAQ disconnected; the Scanner panel has an explicit DAQ Connect/Disconnect control.
 - Uses one bundled app icon for the Qt window and Windows taskbar identity.
 - Uses a modern console layout with status badges, a larger XY pad, and separated control/setup panels.
 - Optionally controls an ANC300 coarse XYZ positioner without affecting DAQ-only systems.
@@ -149,6 +150,11 @@ assign unique ANC300 axes to X/Y/Z, and state which physical direction correspon
 to each axis's positive command. Apply saves these settings in the current Windows
 user's application-data folder. Use the **Positioner** tab to connect explicitly and
 move using physical direction labels.
+
+The DAQ and ANC300 connections are independent. Connecting or disconnecting either
+device does not connect, disconnect, or change the outputs of the other device.
+Combined **Enable Scanner** and **Safe Ground Scanner** operations require both
+devices to be connected because those commands intentionally coordinate them.
 
 Applying positioner settings sends no movement command. DAQ scanner operation remains
 available when the positioner is disabled, absent, or disconnected.

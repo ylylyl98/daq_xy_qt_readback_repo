@@ -184,7 +184,13 @@ class WindowSafetyTests(unittest.TestCase):
         self._positioner_patcher.stop()
         self._patcher.stop()
 
-    def test_window_initializes_from_existing_hardware_outputs(self) -> None:
+    def _connect_daq(self, win: ui_mod.DaqXYWindow) -> ui_mod.DaqInterface:
+        win._on_daq_connect_clicked()
+        self.assertTrue(win._daq_connected)
+        self.assertIsInstance(win._daq, ui_mod.DaqInterface)
+        return win._daq
+
+    def test_daq_starts_disconnected_with_independent_connection_control(self) -> None:
         win = ui_mod.DaqXYWindow(
             dev_name="Dev1",
             ao_x="ao0",
@@ -195,13 +201,163 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            self.assertFalse(win._daq_connected)
+            self.assertIsNone(win._daq)
+            self.assertEqual(win.btn_daq_connect.text(), "Connect")
+            self.assertFalse(win.chk_enable.isEnabled())
+        finally:
+            win.close()
+
+    def test_daq_connection_button_toggles_without_changing_anc300_connection(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._positioner_connected = True
+            daq = self._connect_daq(win)
+
+            self.assertEqual(win.btn_daq_connect.text(), "Disconnect")
+            self.assertTrue(win._positioner_connected)
+            win._on_daq_connect_clicked()
+            self.assertEqual(win.btn_daq_connect.text(), "Connect")
+            self.assertFalse(win._daq_connected)
+            self.assertTrue(win._positioner_connected)
+            self.assertTrue(daq._daq.ao_task.closed)
+            self.assertEqual(daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_anc300_can_connect_while_daq_is_disconnected(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._positioner_settings = ui_mod.PositionerSettings(enabled=True, port="COM4")
+            win._update_positioner_controls()
+
+            self.assertFalse(win._daq_connected)
+            self.assertTrue(win.btn_positioner_connect.isEnabled())
+        finally:
+            win.close()
+
+    def test_daq_disconnect_does_not_change_anc300_connection(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._positioner_connected = True
+            win._daq_connected = True
+            win._on_daq_disconnected("DAQ disconnected")
+            self.assertTrue(win._positioner_connected)
+            self.assertFalse(win._daq_connected)
+        finally:
+            win.close()
+
+    def test_anc300_disconnect_does_not_stop_daq_or_change_outputs(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win._daq_connected = True
+            win._positioner_connected = True
+            win._enabled = True
+            win._scanner_state = "ACTIVE"
+            win._target_vx, win._target_vy = 3.0, 4.0
+            win._on_positioner_disconnected("ANC300 disconnected")
+            self.assertTrue(win._daq_connected)
+            self.assertTrue(win._enabled)
+            self.assertEqual((win._target_vx, win._target_vy), (3.0, 4.0))
+        finally:
+            win.close()
+
+    def test_daq_connect_initializes_from_existing_hardware_outputs(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            daq = self._connect_daq(win)
             self.assertAlmostEqual(win._vx, 7.0)
             self.assertAlmostEqual(win._vy, 1.25)
             self.assertIn("readback=measured", win.lbl_status.text())
-            self.assertEqual(win._daq._daq.write_calls, [])
+            self.assertEqual(daq._daq.write_calls, [])
             self.assertTrue(win.chk_enable.isEnabled())
             self.assertFalse(win.btn_positioner_connect.isEnabled())
             self.assertEqual(win.lbl_positioner_status.text(), "Not configured")
+        finally:
+            win.close()
+
+    def test_daq_enable_and_motion_ignore_unverified_anc300_state(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            self._connect_daq(win)
+            win._on_positioner_connected("ANC300 test identity")
+            win._positioner_busy = True
+            win._update_positioner_controls()
+
+            win.chk_enable.click()
+
+            self.assertTrue(win._enabled)
+            self.assertTrue(win.btn_right.isEnabled())
+            target_before = (win._target_rx, win._target_ry)
+            win.btn_right.click()
+            self.assertNotEqual((win._target_rx, win._target_ry), target_before)
+        finally:
+            win.close()
+
+    def test_daq_output_enable_control_is_visible_in_scanner_panel(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            win.show()
+            self.app.processEvents()
+
+            self.assertTrue(win.chk_enable.isVisible())
+            self.assertIn("DAQ", win.chk_enable.text())
         finally:
             win.close()
 
@@ -217,6 +373,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            daq = self._connect_daq(win)
             win._positioner_settings = ui_mod.PositionerSettings(
                 enabled=True,
                 port="COM4",
@@ -228,7 +385,7 @@ class WindowSafetyTests(unittest.TestCase):
 
             win._begin_scanner_transition("ground")
             win._ramp_step()
-            self.assertEqual(win._daq._daq.write_calls[-1], (0.0, 0.0))
+            self.assertEqual(daq._daq.write_calls[-1], (0.0, 0.0))
             win._ramp_step()
             win._ramp_step()
             self.assertEqual(requests, [])
@@ -251,10 +408,11 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            daq = self._connect_daq(win)
             win._positioner_settings = ui_mod.PositionerSettings(enabled=True, port="COM4")
             win._positioner_connected = True
             win._readback_uncertain = True
-            win._daq._daq.fail_readback = True
+            daq._daq.fail_readback = True
             requests: list[object] = []
             win._scanner_ground_requested.connect(requests.append)
 
@@ -277,7 +435,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
-            old_daq = win._daq
+            old_daq = self._connect_daq(win)
             win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win._set_target_hw(9.0, 2.5)
@@ -311,7 +469,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
-            old_daq = win._daq
+            old_daq = self._connect_daq(win)
             win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win._set_target_hw(9.0, 2.5)
@@ -344,18 +502,19 @@ class WindowSafetyTests(unittest.TestCase):
             channels_by_device={"Dev1": ["ao0", "ao1"]},
             demo_reason=None,
         )
+        daq = self._connect_daq(win)
         win._scanner_state = "READY"
         win.chk_enable.setChecked(True)
         win._set_target_hw(9.0, 2.5)
         self.assertTrue(win._ramp_timer.isActive())
-        outputs_before_close = dict(win._daq._daq.hardware)
-        writes_before_close = list(win._daq._daq.write_calls)
+        outputs_before_close = dict(daq._daq.hardware)
+        writes_before_close = list(daq._daq.write_calls)
 
         win.close()
 
         self.assertFalse(win._ramp_timer.isActive())
-        self.assertEqual(win._daq._daq.hardware, outputs_before_close)
-        self.assertEqual(win._daq._daq.write_calls, writes_before_close)
+        self.assertEqual(daq._daq.hardware, outputs_before_close)
+        self.assertEqual(daq._daq.write_calls, writes_before_close)
 
     def test_compact_mode_switch_preserves_state_and_does_not_write(self) -> None:
         win = ui_mod.DaqXYWindow(
@@ -368,6 +527,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            daq = self._connect_daq(win)
             win.setGeometry(80, 90, 900, 600)
             win.show()
             self.app.processEvents()
@@ -389,7 +549,7 @@ class WindowSafetyTests(unittest.TestCase):
             self.assertTrue(win.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
             self.assertTrue(win._enabled)
             self.assertEqual((win._target_rx, win._target_ry), original_target)
-            self.assertEqual(win._daq._daq.write_calls, [])
+            self.assertEqual(daq._daq.write_calls, [])
 
             win._exit_compact_mode()
             self.app.processEvents()
@@ -405,7 +565,7 @@ class WindowSafetyTests(unittest.TestCase):
             self.assertFalse(win.isFullScreen())
             self.assertTrue(win._enabled)
             self.assertEqual((win._target_rx, win._target_ry), original_target)
-            self.assertEqual(win._daq._daq.write_calls, [])
+            self.assertEqual(daq._daq.write_calls, [])
         finally:
             win.close()
 
@@ -420,6 +580,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            self._connect_daq(win)
             win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win._enter_compact_mode()
@@ -494,7 +655,7 @@ class WindowSafetyTests(unittest.TestCase):
             )
             self.assertTrue(all(not button.isEnabled() for button in buttons))
             self.assertTrue(win.btn_expand.isEnabled())
-            self.assertEqual(win._daq._daq.write_calls, [])
+            self.assertIsNone(win._daq)
         finally:
             win.close()
 
@@ -518,7 +679,7 @@ class WindowSafetyTests(unittest.TestCase):
             self.assertFalse(win.compact_btn_pos_left.isEnabled())
             self.assertFalse(win.compact_btn_pos_toward.isEnabled())
             self.assertFalse(win.compact_btn_positioner_stop.isEnabled())
-            self.assertEqual(win._daq._daq.write_calls, [])
+            self.assertIsNone(win._daq)
         finally:
             win.close()
 
@@ -549,7 +710,7 @@ class WindowSafetyTests(unittest.TestCase):
 
             self.assertEqual(emitted[-1][1:], ("x", "left", 17))
             self.assertTrue(win._positioner_busy)
-            self.assertEqual(win._daq._daq.write_calls, [])
+            self.assertIsNone(win._daq)
         finally:
             win.close()
 
@@ -611,6 +772,7 @@ class WindowSafetyTests(unittest.TestCase):
             demo_reason=None,
         )
         try:
+            self._connect_daq(win)
             win._scanner_state = "READY"
             win.chk_enable.setChecked(True)
             win.show()

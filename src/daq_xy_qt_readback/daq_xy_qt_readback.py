@@ -932,8 +932,9 @@ class DaqXYWindow(QMainWindow):
         self._positioner_busy = False
         self._positioner_version = ""
         self._positioner_ready = False
-        self._scanner_state = "ANC DISCONNECTED"
-        self._scanner_detail = "Connect the ANC300 before enabling or grounding the scanner."
+        self._daq_connected = False
+        self._scanner_state = "DAQ DISCONNECTED"
+        self._scanner_detail = "Connect the DAQ for analog control; the ANC300 connection is independent."
         self._scanner_pending_action: str | None = None
         self._scanner_zero_stable_samples = 0
         self._scanner_zero_command_written = False
@@ -950,12 +951,9 @@ class DaqXYWindow(QMainWindow):
         self._full_window_minimum_size: QSize | None = None
         self._full_window_maximum_size: QSize | None = None
 
-        if demo_reason:
-            self._daq: DaqInterface | DemoDaqInterface = DemoDaqInterface()
-        else:
-            self._daq = DaqInterface(dev_name, ao_x, ao_y)
-
-        self._pull_outputs_from_daq()
+        self._daq: DaqInterface | DemoDaqInterface | None = None
+        self._vx = self._vy = 0.0
+        self._readback_status = "DAQ disconnected. Connect the DAQ to read outputs."
         self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
         self._target_vx = self._vx
         self._target_vy = self._vy
@@ -970,6 +968,7 @@ class DaqXYWindow(QMainWindow):
         self._populate_mapping_controls()
         self._populate_positioner_controls()
         self._start_positioner_worker()
+        self._set_controls_enabled(self._daq_connected)
         self._sync_ui()
         self._apply_demo_mode_if_needed()
         if self._automatic_update_checks_enabled() and not self._update_preferences.checked_recently():
@@ -1182,6 +1181,12 @@ class DaqXYWindow(QMainWindow):
         self.lbl_scanner_safety.setWordWrap(True)
         self.lbl_scanner_safety.setObjectName("statusDetail")
         vf.addRow("Combined state", self.lbl_scanner_safety)
+        self.lbl_daq_status = self._chip("Disconnected", "off")
+        self.btn_daq_connect = QPushButton("Connect")
+        self.btn_daq_connect.setProperty("role", "primary")
+        vf.addRow("DAQ connection", self._hbox(self.lbl_daq_status, self.btn_daq_connect))
+        self.chk_enable.setText("Enable DAQ output control")
+        vf.addRow("DAQ output", self.chk_enable)
         self.sld_x = QSlider(Qt.Orientation.Horizontal)
         self.sld_y = QSlider(Qt.Orientation.Horizontal)
         self.sld_x.setRange(0, 1000)
@@ -1521,6 +1526,7 @@ class DaqXYWindow(QMainWindow):
 
     def _connect_controls(self) -> None:
         self.chk_enable.toggled.connect(self._on_enable_toggled)
+        self.btn_daq_connect.clicked.connect(self._on_daq_connect_clicked)
         self.btn_home.clicked.connect(lambda: self._set_target_real(5.0, 5.0))
         self.btn_ground.clicked.connect(self._ground_outputs)
         self.btn_scanner_enable.clicked.connect(self._on_scanner_enable_clicked)
@@ -1736,9 +1742,9 @@ class DaqXYWindow(QMainWindow):
 
     def _sync_compact_controls(self) -> None:
         can_nudge = bool(
-            self._enabled
-            and self._scanner_state in {"READY", "ACTIVE"}
-            and not self._positioner_busy
+            self._daq_connected
+            and self._enabled
+            and self._scanner_pending_action is None
             and not self._demo_reason
         )
         for button in (
@@ -2154,6 +2160,7 @@ class DaqXYWindow(QMainWindow):
             self._set_chip(self.lbl_mapping_pending, "Active", "ok")
 
     def _set_controls_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled and self._daq_connected)
         self.chk_enable.setEnabled(enabled)
         self.btn_home.setEnabled(enabled)
         self.btn_ground.setEnabled(enabled)
@@ -2367,10 +2374,10 @@ class DaqXYWindow(QMainWindow):
             return
         transitioning = self._scanner_state in {"RAMPING TO ZERO", "ENABLING", "GROUNDING"}
         motion_enabled = (
-            self._scanner_state in {"READY", "ACTIVE"}
+            self._daq_connected
             and self._enabled
+            and self._scanner_pending_action is None
             and not transitioning
-            and not self._positioner_busy
             and not self._demo_reason
         )
         for widget in (
@@ -2387,6 +2394,8 @@ class DaqXYWindow(QMainWindow):
         ):
             widget.setEnabled(motion_enabled)
         anc_available = (
+            self._daq_connected
+            and
             self._positioner_settings.enabled
             and self._positioner_connected
             and self._positioner_ready
@@ -2419,6 +2428,55 @@ class DaqXYWindow(QMainWindow):
                 anc_available and self._scanner_state != "GROUNDED"
             )
             self.compact_btn_stop_scanner_ramp.setEnabled(self._ramp_timer.isActive())
+
+    def _on_daq_connect_clicked(self) -> None:
+        if self._daq_connected:
+            self._on_daq_disconnected("DAQ disconnected; AO outputs were left unchanged.")
+            return
+        if self._demo_reason:
+            return
+        self.btn_daq_connect.setEnabled(False)
+        self._set_chip(self.lbl_daq_status, "Connecting…", "warning")
+        try:
+            self._daq = DaqInterface(self._selected_device, self._ao_x, self._ao_y)
+            self._daq_connected = True
+            self._pull_outputs_from_daq()
+            self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
+            self._freeze_targets_at_current_output()
+            self._scanner_state = "DAQ READY"
+            self._scanner_detail = "DAQ connected. Connect ANC300 to use combined scanner safety commands."
+            self._set_controls_enabled(True)
+            self._sync_ui()
+        except Exception as exc:
+            self._daq = None
+            self._daq_connected = False
+            self._set_chip(self.lbl_daq_status, "Disconnected", "off")
+            self._set_controls_enabled(False)
+            self._update_status()
+            if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() != "offscreen":
+                QMessageBox.warning(self, "DAQ", str(exc))
+        finally:
+            self.btn_daq_connect.setEnabled(True)
+
+    def _on_daq_disconnected(self, detail: str = "DAQ disconnected; AO outputs were left unchanged.") -> None:
+        self._ramp_timer.stop()
+        self._enabled = False
+        self.chk_enable.blockSignals(True)
+        self.chk_enable.setChecked(False)
+        self.chk_enable.blockSignals(False)
+        daq = self._daq
+        self._daq = None
+        self._daq_connected = False
+        if daq is not None:
+            try:
+                daq.close()
+            except Exception as exc:
+                LOGGER.warning("DAQ disconnect failed: %s", exc)
+        self._scanner_pending_action = None
+        self._scanner_state = "DAQ DISCONNECTED"
+        self._scanner_detail = detail
+        self._set_controls_enabled(False)
+        self._update_status()
 
     def _on_positioner_connect_clicked(self) -> None:
         if self._positioner_connected:
@@ -2486,16 +2544,12 @@ class DaqXYWindow(QMainWindow):
         self._positioner_ready = False
         self._positioner_version = ""
         self._scanner_pending_action = None
-        if self._enabled and not self._readback_uncertain:
-            self._scanner_state = "FAULT"
-            self._scanner_detail = "ANC300 disconnected; DAQ is ramping toward 0 V but grounding is not verified."
-            self._target_vx = 0.0
-            self._target_vy = 0.0
-            self._target_rx, self._target_ry = map_hw_to_real(0.0, 0.0, self._mapping)
-            self._start_ramp()
-        else:
-            self._scanner_state = "ANC DISCONNECTED"
-            self._scanner_detail = "ANC300 disconnected; scanner grounding is not verified."
+        self._scanner_state = "DAQ READY" if self._daq_connected else "DAQ DISCONNECTED"
+        self._scanner_detail = (
+            "ANC300 disconnected; DAQ remains independently connected and its outputs are unchanged."
+            if self._daq_connected
+            else "ANC300 disconnected; scanner grounding is not verified."
+        )
         self._update_positioner_controls(reason)
 
     @pyqtSlot(str)
@@ -2639,6 +2693,8 @@ class DaqXYWindow(QMainWindow):
         self._sync_compact_controls()
         self._update_scanner_controls()
         self._update_window_title()
+        if hasattr(self, "btn_daq_connect"):
+            self.btn_daq_connect.setText("Disconnect" if self._daq_connected else "Connect")
         if self._demo_reason:
             if hasattr(self, "lbl_output_chip"):
                 self._set_chip(self.lbl_output_chip, "OFF", "off")
@@ -2650,6 +2706,11 @@ class DaqXYWindow(QMainWindow):
         readback_state = "cached/uncertain" if self._readback_uncertain else "measured"
         if hasattr(self, "lbl_output_chip"):
             self._set_chip(self.lbl_output_chip, f"DAQ {en}", "on" if self._enabled else "off")
+            self._set_chip(
+                self.lbl_daq_status,
+                "Connected" if self._daq_connected else "Disconnected",
+                "ok" if self._daq_connected else "off",
+            )
             self._set_chip(
                 self.lbl_readback_chip,
                 "Uncertain" if self._readback_uncertain else "Measured",
@@ -2689,7 +2750,7 @@ class DaqXYWindow(QMainWindow):
         self._target_vx = clamp_voltage(vx)
         self._target_vy = clamp_voltage(vy)
         self._target_rx, self._target_ry = map_hw_to_real(self._target_vx, self._target_vy, self._mapping)
-        if self._scanner_pending_action is None and self._scanner_state in {"READY", "ACTIVE"}:
+        if self._scanner_pending_action is None and self._scanner_state in {"DAQ READY", "READY", "ACTIVE"}:
             tolerance = float(self._positioner_settings.scanner_zero_tolerance_v)
             self._scanner_state = (
                 "READY"
@@ -2702,7 +2763,7 @@ class DaqXYWindow(QMainWindow):
             self._start_ramp()
 
     def _set_target_real(self, rx: float, ry: float) -> None:
-        if self._scanner_state not in {"READY", "ACTIVE"} or self._scanner_pending_action is not None:
+        if not self._daq_connected or not self._enabled or self._scanner_pending_action is not None:
             return
         # Project requested real-space point onto the true reachable region.
         trg_vx, trg_vy = map_real_to_hw(float(rx), float(ry), self._mapping)
@@ -2712,7 +2773,7 @@ class DaqXYWindow(QMainWindow):
         self._set_target_hw(trg_vx, trg_vy)
 
     def _nudge_real(self, drx: float, dry: float) -> None:
-        if self._scanner_state not in {"READY", "ACTIVE"} or self._scanner_pending_action is not None:
+        if not self._daq_connected or not self._enabled or self._scanner_pending_action is not None:
             return
         base_rx = self._target_rx
         base_ry = self._target_ry
@@ -2736,7 +2797,7 @@ class DaqXYWindow(QMainWindow):
         self._set_target_real(next_rx, next_ry)
 
     def _on_enable_toggled(self, checked: bool) -> None:
-        if self._demo_reason:
+        if self._demo_reason or not self._daq_connected:
             self.chk_enable.setChecked(False)
             self._enabled = False
             self._update_status()
@@ -2750,7 +2811,7 @@ class DaqXYWindow(QMainWindow):
     def _on_hw_control_changed(self, axis: str, value: float) -> None:
         if self._syncing:
             return
-        if self._scanner_state not in {"READY", "ACTIVE"} or self._scanner_pending_action is not None:
+        if not self._daq_connected or not self._enabled or self._scanner_pending_action is not None:
             self._sync_ui()
             return
         if axis == "x":
@@ -2766,9 +2827,9 @@ class DaqXYWindow(QMainWindow):
     def _begin_scanner_transition(self, action: str) -> None:
         if action not in {"enable", "ground"}:
             raise ValueError(f"Unknown scanner transition: {action}")
-        if not self._positioner_connected or self._positioner_busy:
+        if not self._daq_connected or not self._positioner_connected or self._positioner_busy:
             self._scanner_state = "FAULT"
-            self._scanner_detail = "Connect the ANC300 before changing scanner mode."
+            self._scanner_detail = "Connect both the DAQ and ANC300 before changing scanner mode."
             self._sync_ui()
             return
         self._scanner_pending_action = action
@@ -2849,7 +2910,7 @@ class DaqXYWindow(QMainWindow):
             self._ramp_timer.start(self.ramp.dwell_ms)
 
     def _ramp_step(self) -> None:
-        if not self._enabled:
+        if not self._enabled or not self._daq_connected or self._daq is None:
             self._ramp_timer.stop()
             return
         dx = self._target_vx - self._vx
@@ -2973,7 +3034,11 @@ class DaqXYWindow(QMainWindow):
             device_or_channel_changed = bool(
                 (not self._demo_reason) and (dev != self._selected_device or chx != self._ao_x or chy != self._ao_y)
             )
-            if not self._demo_reason and (dev != self._selected_device or chx != self._ao_x or chy != self._ao_y):
+            if (
+                self._daq_connected
+                and not self._demo_reason
+                and (dev != self._selected_device or chx != self._ao_x or chy != self._ao_y)
+            ):
                 if _ramp_was_active:
                     LOGGER.info(
                         "Stopping active ramp before reconnecting DAQ channels so scanner outputs remain undisturbed."
@@ -2990,11 +3055,15 @@ class DaqXYWindow(QMainWindow):
                     old_daq.close()
                 except Exception:
                     LOGGER.debug("Failed closing previous DAQ interface.", exc_info=True)
+            elif not self._daq_connected and not self._demo_reason:
+                self._selected_device = dev
+                self._ao_x = chx
+                self._ao_y = chy
 
             # Mapping changes do not command movement; they only change interpretation.
             self._mapping = new_mapping
             self._update_pad_projection()
-            if device_or_channel_changed:
+            if device_or_channel_changed and self._daq_connected:
                 self._refresh_from_hardware()
             else:
                 # Keep hardware setpoints unchanged; only remap display coordinates.
@@ -3093,7 +3162,8 @@ class DaqXYWindow(QMainWindow):
                 if not self._positioner_thread.wait(8000):
                     LOGGER.warning("Positioner worker did not stop before the UI closed.")
             LOGGER.info("Closing scanner UI without altering current AO outputs.")
-            self._daq.close()
+            if self._daq is not None:
+                self._daq.close()
         finally:
             _release_windows_native_window_icon(self)
             super().closeEvent(e)
