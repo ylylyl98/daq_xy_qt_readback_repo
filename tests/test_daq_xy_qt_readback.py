@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
 from PyQt6.QtCore import QPoint, QRect, QSize, Qt
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication
 
@@ -423,6 +424,220 @@ class WindowSafetyTests(unittest.TestCase):
             self.assertEqual(win._scanner_state, "FAULT")
         finally:
             win.close()
+
+    def test_daq_ground_ramps_to_hardware_zero_without_anc300(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(rotation_enabled=True, rotation_deg=37.0),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            daq = self._connect_daq(win)
+            scanner_requests: list[object] = []
+            win._scanner_ground_requested.connect(scanner_requests.append)
+
+            win._ground_daq_outputs()
+            for _ in range(200):
+                win._ramp_step()
+                if win._daq_ground_state == "GROUNDED":
+                    break
+
+            self.assertEqual(daq._daq.write_calls[-1], (0.0, 0.0))
+            self.assertEqual(win._daq_ground_state, "GROUNDED")
+            self.assertEqual(scanner_requests, [])
+            self.assertFalse(win._positioner_connected)
+            self.assertAlmostEqual(win._target_vx, 0.0)
+            self.assertAlmostEqual(win._target_vy, 0.0)
+            self.assertIn("DAQ AT ZERO", win.compact_lbl_scanner_state.text())
+            win._enabled = True
+            win._set_target_hw(1.0, 1.0)
+            self.assertEqual(win._daq_ground_state, "READY")
+        finally:
+            win.close()
+
+    def test_daq_ground_is_withheld_when_readback_is_uncertain(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            daq = self._connect_daq(win)
+            daq._daq.fail_readback = True
+            win._ground_daq_outputs()
+
+            self.assertEqual(win._daq_ground_state, "FAULT")
+            self.assertFalse(win._daq_ground_pending)
+            self.assertEqual(daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_close_confirmation_starts_daq_only_ground_and_cancel_is_default(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1",
+            ao_x="ao0",
+            ao_y="ao1",
+            mapping=MappingSettings(),
+            devices=["Dev1"],
+            channels_by_device={"Dev1": ["ao0", "ao1"]},
+            demo_reason=None,
+        )
+        try:
+            self._connect_daq(win)
+            with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "windows"}), mock.patch.object(
+                ui_mod.QMessageBox,
+                "question",
+                return_value=ui_mod.QMessageBox.StandardButton.Cancel,
+            ) as question:
+                cancel_event = QCloseEvent()
+                win.closeEvent(cancel_event)
+            question.assert_called_once()
+            self.assertFalse(cancel_event.isAccepted())
+            self.assertFalse(win._close_pending)
+
+            with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "windows"}), mock.patch.object(
+                ui_mod.QMessageBox,
+                "question",
+                return_value=ui_mod.QMessageBox.StandardButton.Close,
+            ), mock.patch.object(win, "_ground_daq_outputs") as ground:
+                close_event = QCloseEvent()
+                win.closeEvent(close_event)
+            self.assertFalse(close_event.isAccepted())
+            self.assertTrue(win._close_pending)
+            ground.assert_called_once_with()
+        finally:
+            win._close_pending = False
+            win._close_approved = True
+            win.close()
+
+    def test_close_exits_only_after_verified_daq_zero(self) -> None:
+        FakeDaqControl.initial_outputs = {"ao0": 0.20, "ao1": 0.10}
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1", ao_x="ao0", ao_y="ao1", mapping=MappingSettings(),
+            devices=["Dev1"], channels_by_device={"Dev1": ["ao0", "ao1"]}, demo_reason=None,
+        )
+        try:
+            daq = self._connect_daq(win)
+            with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "windows"}), mock.patch.object(
+                ui_mod.QMessageBox, "question", return_value=ui_mod.QMessageBox.StandardButton.Close,
+            ), mock.patch.object(ui_mod.QTimer, "singleShot", side_effect=lambda _ms, callback: callback()), mock.patch.object(
+                win, "close", wraps=win.close,
+            ) as close:
+                event = QCloseEvent()
+                win.closeEvent(event)
+                self.assertFalse(close.called)
+                for _ in range(20):
+                    win._ramp_step()
+                    if close.called:
+                        break
+            self.assertTrue(close.called)
+            self.assertEqual(daq._daq.write_calls[-1], (0.0, 0.0))
+            self.assertEqual(win._daq_ground_state, "GROUNDED")
+        finally:
+            win._close_pending = False
+            win._close_approved = True
+            win.close()
+
+    def test_close_during_anc300_transition_stays_open_without_daq_ground(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1", ao_x="ao0", ao_y="ao1", mapping=MappingSettings(),
+            devices=["Dev1"], channels_by_device={"Dev1": ["ao0", "ao1"]}, demo_reason=None,
+        )
+        try:
+            self._connect_daq(win)
+            win._positioner_connected = True
+            win._positioner_settings = ui_mod.PositionerSettings(enabled=True, port="COM4")
+            win._begin_scanner_transition("ground")
+            win._scanner_state = "GROUNDING"
+            win._positioner_busy = True
+            with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "windows"}), mock.patch.object(
+                ui_mod.QMessageBox, "question", return_value=ui_mod.QMessageBox.StandardButton.Close,
+            ), mock.patch.object(win, "_ground_daq_outputs") as ground:
+                event = QCloseEvent()
+                win.closeEvent(event)
+            self.assertFalse(event.isAccepted())
+            self.assertFalse(win._close_pending)
+            self.assertEqual(win._scanner_pending_action, "ground")
+            ground.assert_not_called()
+        finally:
+            win._close_pending = False
+            win._close_approved = True
+            win.close()
+
+    def test_stop_ramp_cancels_pending_close(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1", ao_x="ao0", ao_y="ao1", mapping=MappingSettings(),
+            devices=["Dev1"], channels_by_device={"Dev1": ["ao0", "ao1"]}, demo_reason=None,
+        )
+        try:
+            self._connect_daq(win)
+            with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "windows"}), mock.patch.object(
+                ui_mod.QMessageBox, "question", return_value=ui_mod.QMessageBox.StandardButton.Close,
+            ):
+                event = QCloseEvent()
+                win.closeEvent(event)
+            self.assertTrue(win._close_pending)
+            win._stop_scanner_ramp()
+            self.assertFalse(win._close_pending)
+            self.assertFalse(win._daq_ground_pending)
+        finally:
+            win._close_pending = False
+            win._close_approved = True
+            win.close()
+
+    def test_daq_ground_mid_ramp_readback_failure_stops_without_more_writes(self) -> None:
+        FakeDaqControl.initial_outputs = {"ao0": 1.0, "ao1": 1.0}
+        win = ui_mod.DaqXYWindow(
+            dev_name="Dev1", ao_x="ao0", ao_y="ao1", mapping=MappingSettings(),
+            devices=["Dev1"], channels_by_device={"Dev1": ["ao0", "ao1"]}, demo_reason=None,
+        )
+        try:
+            daq = self._connect_daq(win)
+            win._ground_daq_outputs()
+            win._ramp_step()
+            writes_before_failure = len(daq._daq.write_calls)
+            daq._daq.fail_readback = True
+            win._ramp_step()
+            self.assertFalse(win._daq_ground_pending)
+            self.assertEqual(len(daq._daq.write_calls), writes_before_failure + 1)
+            win._ramp_step()
+            self.assertEqual(len(daq._daq.write_calls), writes_before_failure + 1)
+        finally:
+            win.close()
+
+    def test_daq_ground_stuck_nonzero_feedback_is_bounded(self) -> None:
+        class StuckDaq(FakeDaqControl):
+            def write_x(self) -> None:
+                self.write_calls.append(tuple(float(v) for v in self.x_values))
+                self.read_y()
+
+        with mock.patch.object(ui_mod, "_RealDaqControl", StuckDaq):
+            win = ui_mod.DaqXYWindow(
+                dev_name="Dev1", ao_x="ao0", ao_y="ao1", mapping=MappingSettings(),
+                devices=["Dev1"], channels_by_device={"Dev1": ["ao0", "ao1"]}, demo_reason=None,
+            )
+            try:
+                daq = self._connect_daq(win)
+                win._ground_daq_outputs()
+                for _ in range(ui_mod.ZERO_VERIFY_MAX_ATTEMPTS + 60):
+                    win._ramp_step()
+                    if not win._daq_ground_pending:
+                        break
+                self.assertFalse(win._daq_ground_pending)
+                self.assertEqual(win._daq_ground_state, "FAULT")
+                writes = len(daq._daq.write_calls)
+                win._ramp_step()
+                self.assertEqual(len(daq._daq.write_calls), writes)
+            finally:
+                win.close()
 
     def test_apply_mapping_save_failure_keeps_outputs_unchanged_and_ramp_stopped(self) -> None:
         win = ui_mod.DaqXYWindow(

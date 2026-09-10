@@ -101,15 +101,22 @@ GitHub Actions Windows release workflow.
 ## Compact controller
 
 Click **Compact** in the full window to switch to a small, always-on-top controller.
-Use **Enable Scanner** to complete the verified DAQ-near-zero and ANC300 stepping-mode
-sequence; directional controls remain disabled until the scanner reaches READY. Each
-click keeps the existing ramped `0.05 V` real-space nudge behavior.
+DAQ directional controls work independently of the ANC300 connection. Use
+**Enable Scanner** when you also need the verified DAQ-near-zero and ANC300
+stepping-mode sequence. Each click keeps the existing ramped `0.05 V` real-space
+nudge behavior.
 
 - Click the center restore button or press `Esc` to return to the full interface.
 - When the compact window has keyboard focus, the arrow keys nudge in the matching direction.
 - Switching views does not reconnect the DAQ or change the current output or target.
-- When active hardware is detected during close, the UI offers a safe shutdown sequence
-  that ramps the DAQ to near zero before grounding the mapped ANC300 axes.
+- **Ground DAQ** ramps the scanner's hardware X/Y outputs to 0 V without changing
+  ANC300 modes. It is available in both full and compact views.
+- Closing with a connected DAQ asks **Ramp X/Y to 0 V and close?** Choose **Close**
+  to ramp and verify zero before exiting, or **Cancel** (the default) to keep working.
+  A failed or interrupted ramp keeps the app open. ANC300 modes are unchanged.
+- Low-level connection cleanup does not command a voltage reset. A crash cannot
+  execute the normal close sequence; retention of output voltage after a crash
+  depends on the DAQ hardware and driver and must be verified on the instrument.
 
 ## Expected folder structure
 
@@ -153,7 +160,7 @@ move using physical direction labels.
 
 The DAQ and ANC300 connections are independent. Connecting or disconnecting either
 device does not connect, disconnect, or change the outputs of the other device.
-Combined **Enable Scanner** and **Safe Ground Scanner** operations require both
+Combined **Enable Scanner** and **Ground Scanner + ANC300** operations require both
 devices to be connected because those commands intentionally coordinate them.
 
 Applying positioner settings sends no movement command. DAQ scanner operation remains
@@ -165,13 +172,19 @@ connects them to chassis ground. Use **ENABLE POSITIONER** to explicitly return 
 configured positioner axes to stepping mode before issuing movement commands.
 
 The positioner controls are separate from the scanner controls. Configure the ANC300
-scanner X/Y axes separately in Setup (defaults: axes 1/2). **Scanner → Ground** first
+scanner X/Y axes separately in Setup (defaults: axes 1/2). **Ground Scanner + ANC300** first
 ramps DAQ AO0/AO1 to 0 V, then grounds only those mapped ANC300 scanner axes.
 **Positioner → Ground Positioner** controls only the configured ANC300 positioner axes.
 
-The scanner is treated as one combined DAQ + ANC300 instrument. **Enable Scanner**
+**Ground DAQ** needs only the DAQ connection and targets hardware X/Y 0 V regardless
+of coordinate mapping. It replaces any active movement target, blocks competing
+movement while ramping, and holds at zero after completion. **Stop Ramp** interrupts
+the ramp at its current output.
+
+For combined DAQ + ANC300 operations, **Enable Scanner**
 first verifies several consecutive DAQ readbacks inside the configured near-zero
-tolerance, then enables ANC300 stepping. **Safe Ground Scanner** locks movement,
+tolerance, then enables ANC300 stepping. **Ground Scanner + ANC300** (shown as
+**Ground DAQ + ANC300** in compact mode) locks movement,
 ramps the DAQ command toward 0 V, waits for three stable near-zero readbacks, and only
 then sends and verifies ANC300 GND mode. Readback uncertainty or any failed check
 blocks the ANC300 mode change. The default tolerance is ±0.010 V and is configurable
