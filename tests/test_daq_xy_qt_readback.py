@@ -813,6 +813,8 @@ class WindowSafetyTests(unittest.TestCase):
             win.compact_btn_down.click()
             self.assertAlmostEqual(win._target_rx, start_x)
             self.assertAlmostEqual(win._target_ry, start_y)
+            win.compact_btn_center.click()
+            self.assertEqual((win._target_rx, win._target_ry), (5.0, 5.0))
         finally:
             win.close()
 
@@ -863,6 +865,7 @@ class WindowSafetyTests(unittest.TestCase):
         try:
             win._enter_compact_mode()
             buttons = (
+                win.compact_btn_center,
                 win.compact_btn_left,
                 win.compact_btn_right,
                 win.compact_btn_up,

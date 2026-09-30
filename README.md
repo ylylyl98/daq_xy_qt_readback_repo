@@ -181,6 +181,11 @@ of coordinate mapping. It replaces any active movement target, blocks competing
 movement while ramping, and holds at zero after completion. **Stop Ramp** interrupts
 the ramp at its current output.
 
+In both layouts, **Center (X=5, Y=5)** sits between the DAQ direction buttons and
+returns to the real-space center. **Stop Ramp** is directly below the direction pad.
+The separate **Output control** group contains **Enable Scanner**, **DAQ → 0 V**,
+and **DAQ → 0 V + ANC300 GND**; these retain the grounding behavior described above.
+
 For combined DAQ + ANC300 operations, **Enable Scanner**
 first verifies several consecutive DAQ readbacks inside the configured near-zero
 tolerance, then enables ANC300 stepping. **Ground Scanner + ANC300** (shown as
@@ -193,6 +198,23 @@ in Setup.
 Positioner motion requires an explicit **Enable Positioner** action. Grounding sends
 STOP before switching each configured positioner axis to GND; movement never silently
 re-enables a grounded positioner axis.
+
+Both layouts offer **Step** and **Continuous** modes. Step sends the selected count
+(X/Y: 1–1000; Z: 1–100). Continuous uses the ANC300 continuous stepping command:
+hold a direction button to move and release it to stop. The step count is unused in
+Continuous mode; speed follows the controller's existing frequency and amplitude.
+Changing modes, hiding the held button, losing window focus, or closing the window
+requests STOP. Other directions are locked while moving; STOP remains available.
+Compact arrow-key shortcuts apply only in Step mode; Continuous uses the held buttons.
+
+Finite moves stay busy for the interval estimated from step count / queried frequency
+plus 250 ms, then send STOP and wait for acknowledgment before accepting another move.
+This is a conservative timing guard, not position feedback or an arrival measurement.
+Do not change the controller frequency externally during a move. Explicit busy/moving
+rejections are stopped and shown in the status text without disconnecting after STOP
+succeeds. Other command/communication failures remain errors. Stop requests are handled
+after any serial exchange already in progress; a lost connection cannot guarantee a
+hardware stop. These controls must be verified on the connected instrument before use.
 
 ## Troubleshooting
 

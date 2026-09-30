@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import math
+import re
 from pathlib import Path
 import time
 from typing import Any, Callable
@@ -12,6 +14,10 @@ from typing import Any, Callable
 VALID_X_DIRECTIONS = ("left", "right")
 VALID_Y_DIRECTIONS = ("up", "down")
 VALID_Z_DIRECTIONS = ("toward", "away")
+
+
+class ANC300BusyError(RuntimeError):
+    """The controller rejected a command because stepping is still active."""
 
 
 @dataclass(frozen=True)
@@ -183,6 +189,24 @@ class ANC300Positioner:
         maximum = 100 if axis == "z" else 1000
         if steps < 1 or steps > maximum:
             raise ValueError(f"{axis.upper()} move must be between 1 and {maximum} steps.")
+        return self._start_move(settings, axis, physical_direction, str(steps))
+
+    def start_continuous(self, settings: PositionerSettings, axis: str, direction: str) -> str:
+        return self._start_move(settings, axis, direction, "c")
+
+    def step_duration(self, settings: PositionerSettings, axis: str, steps: int) -> float:
+        """Conservative stepping interval, not position feedback."""
+        response = self._exchange(f"getf {settings.axis_number(axis)}")
+        body = "\n".join(line for line in response.splitlines() if line != "OK").strip()
+        match = re.fullmatch(r"(?:frequency\s*=\s*)?([0-9]+(?:\.[0-9]+)?)\s*(?:Hz)?", body, re.I)
+        if match is None:
+            raise RuntimeError(f"Invalid ANC300 frequency response: {response}")
+        frequency = float(match.group(1))
+        if not math.isfinite(frequency) or not 1 <= frequency <= 10000:
+            raise RuntimeError(f"Invalid ANC300 frequency: {frequency}")
+        return steps / frequency + 0.25
+
+    def _start_move(self, settings: PositionerSettings, axis: str, physical_direction: str, count: str) -> str:
         axis_number = settings.axis_number(axis)
         if axis_number not in self._axes:
             raise RuntimeError("The saved axis mapping does not match the active ANC300 connection.")
@@ -190,7 +214,7 @@ class ANC300Positioner:
         if "stp" not in mode:
             raise RuntimeError(f"ANC300 axis {axis_number} is not enabled for stepping: {mode or '<empty>'}")
         command = "stepu" if settings.is_positive_move(axis, physical_direction) else "stepd"
-        return self._exchange(f"{command} {axis_number} {steps}")
+        return self._exchange(f"{command} {axis_number} {count}")
 
     def stop_all(self) -> None:
         if not self.connected:
@@ -307,22 +331,24 @@ class ANC300Positioner:
 
         deadline = time.monotonic() + 1.5
         lines: list[str] = []
+        terminated = False
         while time.monotonic() < deadline:
             raw = self._serial.readline()
             if not raw:
-                if lines:
-                    break
                 continue
             line = raw.decode("ascii", errors="replace").strip()
-            if not line or line == command:
+            if not line or line == command or line.endswith(">"):
                 continue
             lines.append(line)
             upper = line.upper()
-            if upper == "OK" or upper.startswith("ERROR") or line.endswith(">"):
+            if upper == "OK" or upper.startswith("ERROR"):
+                terminated = True
                 break
         response = "\n".join(lines).strip()
-        if not response:
-            raise TimeoutError(f"No response to ANC300 command: {command}")
-        if any(line.upper().startswith("ERROR") for line in lines):
+        if not terminated:
+            raise TimeoutError(f"No complete response to ANC300 command: {command}: {response or '<empty>'}")
+        if any(line.upper().startswith(("ERROR", "WARNING")) for line in lines):
+            if re.search(r"\b(?:busy|already moving|axis(?:\s+\d+)?\s+is moving)\b", response, re.I):
+                raise ANC300BusyError(response)
             raise RuntimeError(response)
         return response
