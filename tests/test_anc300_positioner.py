@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import json
 import sys
 import tempfile
 import unittest
@@ -67,6 +68,22 @@ class FailingCloseSerial(FakeSerial):
 
 
 class PositionerMappingTests(unittest.TestCase):
+    def test_legacy_settings_do_not_reserve_anc300_axes_for_daq(self) -> None:
+        payload = {
+            "enabled": True, "port": "COM9", "x_axis": 1, "y_axis": 2, "z_axis": 3,
+            "scanner_x_axis": 1, "scanner_y_axis": 2, "scanner_zero_tolerance_v": 0.01,
+            "x_positive": "right", "y_positive": "down", "z_positive": "away",
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "positioner_settings.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            settings = load_positioner_settings(path)
+            self.assertTrue(settings.enabled)
+            self.assertEqual(settings.port, "COM9")
+            self.assertEqual((settings.x_axis, settings.y_axis, settings.z_axis), (1, 2, 3))
+            self.assertEqual(settings.x_positive, "right")
+            settings.validate()
+
     def test_physical_directions_map_through_user_choices(self) -> None:
         settings = PositionerSettings(
             enabled=True,
@@ -87,23 +104,6 @@ class PositionerMappingTests(unittest.TestCase):
         settings = PositionerSettings(enabled=True, port="COM4", x_axis=4, y_axis=4, z_axis=6)
         with self.assertRaisesRegex(ValueError, "different"):
             settings.validate()
-
-    def test_scanner_and_positioner_axes_cannot_overlap(self) -> None:
-        settings = PositionerSettings(
-            enabled=True,
-            port="COM4",
-            scanner_x_axis=1,
-            scanner_y_axis=4,
-            x_axis=4,
-            y_axis=5,
-            z_axis=6,
-        )
-        with self.assertRaisesRegex(ValueError, "different ANC300 axes"):
-            settings.validate()
-
-    def test_zero_tolerance_has_safe_bounds(self) -> None:
-        with self.assertRaisesRegex(ValueError, "zero tolerance"):
-            PositionerSettings(scanner_zero_tolerance_v=0.0001).validate()
 
     def test_settings_round_trip(self) -> None:
         settings = PositionerSettings(enabled=True, port="COM7", x_axis=4, y_axis=5, z_axis=7)
@@ -165,21 +165,6 @@ class ANC300ProtocolTests(unittest.TestCase):
             ["setm 4 stp", "getm 4", "setm 5 stp", "getm 5", "setm 6 stp", "getm 6"],
         )
         self.assertEqual(detail, "Enabled ANC300 stepping on axes: 4, 5, 6")
-
-    def test_scanner_mode_commands_only_use_scanner_axes(self) -> None:
-        self.positioner.connect(self.settings)
-        ground_detail = self.positioner.ground_scanner(self.settings)
-        self.assertEqual(
-            self.serial.writes[-4:],
-            ["setm 1 gnd", "getm 1", "setm 2 gnd", "getm 2"],
-        )
-        enable_detail = self.positioner.enable_scanner(self.settings)
-        self.assertEqual(
-            self.serial.writes[-4:],
-            ["setm 1 stp", "getm 1", "setm 2 stp", "getm 2"],
-        )
-        self.assertEqual(ground_detail, "Grounded ANC300 scanner axes: 1, 2")
-        self.assertEqual(enable_detail, "Enabled ANC300 scanner axes: 1, 2")
 
     def test_z_single_move_limit_is_enforced(self) -> None:
         self.positioner.connect(self.settings)

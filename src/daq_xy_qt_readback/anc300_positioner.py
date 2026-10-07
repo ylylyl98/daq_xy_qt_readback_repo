@@ -30,28 +30,16 @@ class PositionerSettings:
     x_axis: int = 4
     y_axis: int = 5
     z_axis: int = 6
-    scanner_x_axis: int = 1
-    scanner_y_axis: int = 2
-    scanner_zero_tolerance_v: float = 0.01
     x_positive: str = "left"
     y_positive: str = "up"
     z_positive: str = "toward"
 
     def validate(self) -> None:
         axes = (self.x_axis, self.y_axis, self.z_axis)
-        scanner_axes = (self.scanner_x_axis, self.scanner_y_axis)
         if any(axis < 1 or axis > 7 for axis in axes):
             raise ValueError("Positioner axes must be between 1 and 7.")
         if len(set(axes)) != 3:
             raise ValueError("X, Y, and Z must use different ANC300 axes.")
-        if any(axis < 1 or axis > 7 for axis in scanner_axes):
-            raise ValueError("Scanner axes must be between 1 and 7.")
-        if self.scanner_x_axis == self.scanner_y_axis:
-            raise ValueError("Scanner X and Y must use different ANC300 axes.")
-        if set(axes) & set(scanner_axes):
-            raise ValueError("Scanner and positioner must use different ANC300 axes.")
-        if not 0.001 <= float(self.scanner_zero_tolerance_v) <= 0.5:
-            raise ValueError("Scanner zero tolerance must be between 0.001 V and 0.5 V.")
         if self.enabled and not self.port.strip():
             raise ValueError("Select a COM port before enabling the positioner.")
         if self.baudrate <= 0:
@@ -68,12 +56,6 @@ class PositionerSettings:
             return {"x": self.x_axis, "y": self.y_axis, "z": self.z_axis}[axis]
         except KeyError as exc:
             raise ValueError(f"Unknown positioner axis: {axis}") from exc
-
-    def scanner_axis_number(self, axis: str) -> int:
-        try:
-            return {"x": self.scanner_x_axis, "y": self.scanner_y_axis}[axis]
-        except KeyError as exc:
-            raise ValueError(f"Unknown scanner axis: {axis}") from exc
 
     def positive_direction(self, axis: str) -> str:
         try:
@@ -106,9 +88,6 @@ def load_positioner_settings(path: Path) -> PositionerSettings:
             x_axis=int(payload.get("x_axis", 4)),
             y_axis=int(payload.get("y_axis", 5)),
             z_axis=int(payload.get("z_axis", 6)),
-            scanner_x_axis=int(payload.get("scanner_x_axis", 1)),
-            scanner_y_axis=int(payload.get("scanner_y_axis", 2)),
-            scanner_zero_tolerance_v=float(payload.get("scanner_zero_tolerance_v", 0.01)),
             x_positive=str(payload.get("x_positive", "left")).lower(),
             y_positive=str(payload.get("y_positive", "up")).lower(),
             z_positive=str(payload.get("z_positive", "toward")).lower(),
@@ -247,44 +226,6 @@ class ANC300Positioner:
         if errors:
             raise RuntimeError("; ".join(errors))
         return "Grounded ANC300 axes: " + ", ".join(grounded)
-
-    def ground_scanner(self, settings: PositionerSettings) -> str:
-        """Put the separately mapped ANC300 scanner axes into GND mode."""
-        if not self.connected:
-            raise RuntimeError("ANC300 is not connected.")
-        grounded: list[str] = []
-        errors: list[str] = []
-        for axis in (settings.scanner_x_axis, settings.scanner_y_axis):
-            try:
-                self._exchange(f"setm {axis} gnd")
-                mode = self._exchange(f"getm {axis}").lower()
-                if "gnd" not in mode:
-                    raise RuntimeError(f"readback was {mode or '<empty>'}, expected gnd")
-                grounded.append(str(axis))
-            except Exception as exc:
-                errors.append(f"axis {axis}: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
-        return "Grounded ANC300 scanner axes: " + ", ".join(grounded)
-
-    def enable_scanner(self, settings: PositionerSettings) -> str:
-        """Put the separately mapped ANC300 scanner axes into stepping mode."""
-        if not self.connected:
-            raise RuntimeError("ANC300 is not connected.")
-        enabled: list[str] = []
-        errors: list[str] = []
-        for axis in (settings.scanner_x_axis, settings.scanner_y_axis):
-            try:
-                self._exchange(f"setm {axis} stp")
-                mode = self._exchange(f"getm {axis}").lower()
-                if "stp" not in mode:
-                    raise RuntimeError(f"readback was {mode or '<empty>'}, expected stp")
-                enabled.append(str(axis))
-            except Exception as exc:
-                errors.append(f"axis {axis}: {exc}")
-        if errors:
-            raise RuntimeError("; ".join(errors))
-        return "Enabled ANC300 scanner axes: " + ", ".join(enabled)
 
     def enable_all(self) -> str:
         """Put every configured axis into ANC300 stepping mode and verify it."""

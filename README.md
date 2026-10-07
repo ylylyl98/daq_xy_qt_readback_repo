@@ -3,11 +3,11 @@
 PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY pad, sliders, and nudge buttons.
 
 - Output transitions are ramped (no instant jumps).
-- Includes `Home` and `Ground (ramp to 0 V)` actions.
+- Includes `Center (X=5, Y=5)` and `Zero DAQ output` actions.
 - Uses `iv_automation.DaqControl` with a real NI-DAQ device (no simulator fallback).
 - Opens with the NI-DAQ disconnected; the Scanner panel has an explicit DAQ Connect/Disconnect control.
 - Uses one bundled app icon for the Qt window and Windows taskbar identity.
-- Uses a modern console layout with status badges, a larger XY pad, and separated control/setup panels.
+- Uses a single-row header, a larger XY pad, and device-specific status and control panels.
 - Optionally controls an ANC300 coarse XYZ positioner without affecting DAQ-only systems.
 - Includes a compact, always-on-top directional controller for working beside PowerPoint or other applications.
 
@@ -101,15 +101,15 @@ GitHub Actions Windows release workflow.
 ## Compact controller
 
 Click **Compact** in the full window to switch to a small, always-on-top controller.
-DAQ directional controls work independently of the ANC300 connection. Use
-**Enable Scanner** when you also need the verified DAQ-near-zero and ANC300
-stepping-mode sequence. Each click keeps the existing ramped `0.05 V` real-space
-nudge behavior.
+The **Scanner** tab controls only the NI-DAQ; the **Positioner** tab controls only
+ANC300 coarse XYZ motion. Connect the DAQ in Scanner and select **Enable output**
+to allow voltage changes. Enabling preserves the current voltage. Each direction
+click keeps the existing ramped `0.05 V` real-space nudge behavior.
 
 - Click the center restore button or press `Esc` to return to the full interface.
 - When the compact window has keyboard focus, the arrow keys nudge in the matching direction.
 - Switching views does not reconnect the DAQ or change the current output or target.
-- **Ground DAQ** ramps the scanner's hardware X/Y outputs to 0 V without changing
+- **Zero DAQ output** ramps the scanner's hardware X/Y outputs to 0 V without changing
   ANC300 modes. It is available in both full and compact views.
 - Closing with a connected DAQ asks **Ramp X/Y to 0 V and close?** Choose **Close**
   to ramp and verify zero before exiting, or **Cancel** (the default) to keep working.
@@ -160,8 +160,8 @@ move using physical direction labels.
 
 The DAQ and ANC300 connections are independent. Connecting or disconnecting either
 device does not connect, disconnect, or change the outputs of the other device.
-Combined **Enable Scanner** and **Ground Scanner + ANC300** operations require both
-devices to be connected because those commands intentionally coordinate them.
+Scanner enable, zero, and stop commands never send ANC300 commands. Positioner
+enable, ground, and motion commands never change the DAQ outputs.
 
 Applying positioner settings sends no movement command. DAQ scanner operation remains
 available when the positioner is disabled, absent, or disconnected.
@@ -171,29 +171,24 @@ After connecting, use **GROUND POSITIONER** in the **Positioner** tab to send th
 connects them to chassis ground. Use **ENABLE POSITIONER** to explicitly return the
 configured positioner axes to stepping mode before issuing movement commands.
 
-The positioner controls are separate from the scanner controls. Configure the ANC300
-scanner X/Y axes separately in Setup (defaults: axes 1/2). **Ground Scanner + ANC300** first
-ramps DAQ AO0/AO1 to 0 V, then grounds only those mapped ANC300 scanner axes.
-**Positioner → Ground Positioner** controls only the configured ANC300 positioner axes.
+ANC300 is used only for the coarse positioner. Configure its X/Y/Z axes in Setup;
+all distinct axes from 1 through 7 are available. No axes are reserved for the DAQ
+scanner. Old settings files retain their positioner mapping and directions; obsolete
+ANC300 scanner-axis fields are ignored.
 
-**Ground DAQ** needs only the DAQ connection and targets hardware X/Y 0 V regardless
+**Zero DAQ output** needs only the DAQ connection and targets hardware X/Y 0 V regardless
 of coordinate mapping. It replaces any active movement target, blocks competing
 movement while ramping, and holds at zero after completion. **Stop Ramp** interrupts
 the ramp at its current output.
 
 In both layouts, **Center (X=5, Y=5)** sits between the DAQ direction buttons and
 returns to the real-space center. **Stop Ramp** is directly below the direction pad.
-The separate **Output control** group contains **Enable Scanner**, **DAQ → 0 V**,
-and **DAQ → 0 V + ANC300 GND**; these retain the grounding behavior described above.
-
-For combined DAQ + ANC300 operations, **Enable Scanner**
-first verifies several consecutive DAQ readbacks inside the configured near-zero
-tolerance, then enables ANC300 stepping. **Ground Scanner + ANC300** (shown as
-**Ground DAQ + ANC300** in compact mode) locks movement,
-ramps the DAQ command toward 0 V, waits for three stable near-zero readbacks, and only
-then sends and verifies ANC300 GND mode. Readback uncertainty or any failed check
-blocks the ANC300 mode change. The default tolerance is ±0.010 V and is configurable
-in Setup.
+The full Scanner page has an **Enable DAQ output control** checkbox, and Compact has
+an **Enable/Disable output** button beside **Zero output**. Disabling stops voltage
+changes at the current output; use the zero button to ramp to zero. Zeroing blocks competing movement,
+sends an exact 0 V target, and verifies three consecutive readbacks within ±0.010 V.
+Uncertain readback or a failed verification stops the operation and keeps a pending
+close from completing. These checks do not depend on ANC300 settings or connection.
 
 Positioner motion requires an explicit **Enable Positioner** action. Grounding sends
 STOP before switching each configured positioner axis to GND; movement never silently
