@@ -17,11 +17,12 @@ from daq_xy_qt_readback.coordinate_transform import MappingSettings
 class MotionSerial(FakeSerial):
     move_response = None
     fail_stop = False
+    frequency_response = (b"frequency = 100 Hz\r\n", b"OK\r\n")
 
     def write(self, payload):
         super().write(payload)
         if payload.decode().startswith("getf "):
-            self._responses = [b"frequency = 100 Hz\r\n", b"OK\r\n"]
+            self._responses = list(self.frequency_response)
         if payload.decode().startswith(("stepu ", "stepd ")) and self.move_response:
             self._responses = list(self.move_response)
         if payload.decode().startswith("stop ") and self.fail_stop:
@@ -44,6 +45,37 @@ class MotionTests(unittest.TestCase):
 
     def tearDown(self):
         self.worker.shutdown()
+
+    def test_prompted_frequency_echo_allows_up_and_down_with_correct_duration(self):
+        self.serial.frequency_response = (
+            b"> getf 5\r\n", b"frequency = 60 Hz\r\n", b"OK\r\n",
+        )
+        failures = []
+        self.worker.failed.connect(failures.append)
+        for direction, command in (("up", "stepu 5 60"), ("down", "stepd 5 60")):
+            before = len(self.serial.writes)
+            self.worker.move(self.settings, "y", direction, 60)
+            self.assertEqual(failures, [])
+            self.assertEqual(self.serial.writes[before:], ["getf 5", "getm 5", command])
+            # Sixty steps at 60 Hz take one second, plus the 250 ms guard.
+            self.assertGreaterEqual(self.worker._motion_timer.interval(), 1250)
+            self.assertLessEqual(self.worker._motion_timer.interval(), 1251)
+            self.assertTrue(self.worker._motion_timer.isActive())
+            self.worker.stop_all()
+
+    def test_unexpected_frequency_data_never_sends_a_move(self):
+        self.serial.frequency_response = (
+            b"> getf 5\r\n", b"frequency = 60 Hz\r\n", b"unexpected data\r\n", b"OK\r\n",
+        )
+        failures = []
+        self.worker.failed.connect(failures.append)
+        before = len(self.serial.writes)
+        self.worker.move(self.settings, "y", "up", 60)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("unexpected data", failures[0])
+        self.assertFalse(self.worker._motion_timer.isActive())
+        self.assertEqual(self.serial.writes[before:], ["getf 5", "stop 4", "stop 5", "stop 6"])
+        self.assertFalse(self.serial.is_open)
 
     def test_finite_move_stays_busy_until_stop_confirmation(self):
         self.worker.move(self.settings, "x", "left", 100)

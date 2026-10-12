@@ -278,6 +278,9 @@ class ANC300Positioner:
             if not raw:
                 continue
             line = raw.decode("ascii", errors="replace").strip()
+            # The console prompt can share a line with the echoed command.
+            if line.startswith(">"):
+                line = line[1:].lstrip()
             if not line or line == command or line.endswith(">"):
                 continue
             lines.append(line)
