@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import unittest
 import pathlib
 import sys
@@ -77,6 +78,21 @@ class FakeDaqControl:
         if self.fail_readback:
             raise RuntimeError("AO readback unavailable")
         return float(self.y_values[self.y_indexes[variable]])
+
+
+class _CommandOnlyDaq(FakeDaqControl):
+    """Match the real backend: writing does not also perform an AI read."""
+
+    def write_x(self) -> None:
+        self.write_calls.append(tuple(float(v) for v in self.x_values))
+        for address, value in zip(self._ordered_addresses, self.x_values):
+            self.hardware[address] = float(value)
+
+
+class _OffsetReadbackDaq(_CommandOnlyDaq):
+    def read_y(self) -> None:
+        super().read_y()
+        self.y_values = [value + 0.001 for value in self.y_values]
 
 
 class ClampTests(unittest.TestCase):
@@ -165,6 +181,32 @@ class DaqInterfaceSafetyTests(unittest.TestCase):
         self.assertEqual(daq._daq.write_calls, [(2.5, 4.5)])
         self.assertAlmostEqual(daq._daq.hardware["ao0"], 2.5)
         self.assertAlmostEqual(daq._daq.hardware["ao1"], 4.5)
+
+    def test_finite_out_of_range_readback_is_preserved_including_cache(self) -> None:
+        FakeDaqControl.initial_outputs = {"ao0": -2.0, "ao1": 12.0}
+        daq = ui_mod.DaqInterface("Dev1", "ao0", "ao1")
+        try:
+            self.assertEqual(daq.read_outputs(), (-2.0, 12.0))
+            self.assertFalse(daq.readback_uncertain)
+            daq._daq.fail_readback = True
+            self.assertEqual(daq.read_outputs(), (-2.0, 12.0))
+            self.assertTrue(daq.readback_uncertain)
+            self.assertEqual(daq._daq.write_calls, [])
+        finally:
+            daq.close()
+
+    def test_nonfinite_readback_keeps_last_finite_values_and_is_uncertain(self) -> None:
+        FakeDaqControl.initial_outputs = {"ao0": 2.0, "ao1": 4.0}
+        for invalid in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(readback=invalid):
+                daq = ui_mod.DaqInterface("Dev1", "ao0", "ao1")
+                try:
+                    daq._daq.hardware.update(ao0=invalid, ao1=invalid)
+                    self.assertEqual(daq.read_outputs(), (2.0, 4.0))
+                    self.assertTrue(daq.readback_uncertain)
+                    self.assertEqual(daq._daq.write_calls, [])
+                finally:
+                    daq.close()
 
 
 class WindowSafetyTests(unittest.TestCase):
@@ -704,6 +746,264 @@ class WindowSafetyTests(unittest.TestCase):
             finally:
                 win.close()
 
+    def test_out_of_range_readback_blocks_movement_and_zero_without_writes(self) -> None:
+        for voltage in (-2.0, 12.0):
+            for operation in ("move", "zero"):
+                with self.subTest(voltage=voltage, operation=operation):
+                    FakeDaqControl.initial_outputs = {"ao0": voltage, "ao1": 1.0}
+                    win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+                    try:
+                        daq = self._connect_daq(win)
+                        self.assertEqual(win._vx, voltage)
+                        if operation == "zero":
+                            win._close_pending = True
+                            win._ground_daq_outputs()
+                        else:
+                            win.chk_enable.setChecked(True)
+                            win._set_target_hw(2.0, 2.0)
+                        win._ramp_step()
+                        self.assertEqual(daq._daq.write_calls, [])
+                        self.assertEqual(win._daq_ground_state, "FAULT")
+                        self.assertFalse(win._ramp_timer.isActive())
+                        self.assertFalse(win._daq_ground_pending)
+                        self.assertFalse(win._close_pending)
+                    finally:
+                        win._close_pending = False
+                        win.close()
+
+    def test_negative_feedback_after_zero_command_never_verifies_or_closes(self) -> None:
+        class NegativeAfterZero(_CommandOnlyDaq):
+            initial_outputs = {"ao0": 0.10, "ao1": 0.10}
+
+            def write_x(self) -> None:
+                super().write_x()
+                if self.write_calls[-1] == (0.0, 0.0):
+                    self.hardware.update(ao0=-0.5, ao1=-0.5)
+
+        with mock.patch.object(ui_mod, "_RealDaqControl", NegativeAfterZero):
+            win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+            try:
+                daq = self._connect_daq(win)
+                with mock.patch.object(ui_mod.QTimer, "singleShot") as deferred_close:
+                    win._close_pending = True
+                    win._ground_daq_outputs()
+                    for _ in range(100):
+                        win._ramp_step()
+                        if not win._daq_ground_pending:
+                            break
+                    deferred_close.assert_not_called()
+                self.assertEqual(daq._daq.write_calls[-1], (0.0, 0.0))
+                self.assertEqual((win._vx, win._vy), (-0.5, -0.5))
+                self.assertEqual(win._daq_ground_state, "FAULT")
+                self.assertFalse(win._daq_ground_pending)
+                self.assertFalse(win._close_pending)
+            finally:
+                win._close_pending = False
+                win.close()
+
+    def test_normal_ramp_with_adc_offset_finishes_without_rewriting_target(self) -> None:
+        _OffsetReadbackDaq.initial_outputs = {"ao0": 1.0, "ao1": 1.0}
+        with mock.patch.object(ui_mod, "_RealDaqControl", _OffsetReadbackDaq):
+            win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+            try:
+                daq = self._connect_daq(win)
+                initial = (win._vx, win._vy)
+                win.chk_enable.setChecked(True)
+                win._set_target_hw(1.2, 1.3)
+                for _ in range(100):
+                    win._ramp_step()
+                    if not win._ramp_timer.isActive():
+                        break
+                commands = daq._daq.write_calls
+                self.assertFalse(win._ramp_timer.isActive())
+                self.assertTrue(win._enabled)
+                self.assertEqual(commands[-1], (1.2, 1.3))
+                self.assertEqual(commands.count((1.2, 1.3)), 1)
+                self.assertAlmostEqual(win._vx, 1.201)
+                self.assertAlmostEqual(win._vy, 1.301)
+                for previous, current in zip([initial] + commands, commands):
+                    self.assertLessEqual(math.dist(previous, current), win.ramp.step_v + 1e-12)
+            finally:
+                win.close()
+
+    def test_normal_ramp_outside_readback_tolerance_fails_after_bounded_reads(self) -> None:
+        class LargeOffset(_CommandOnlyDaq):
+            initial_outputs = {"ao0": 1.0, "ao1": 1.0}
+
+            def read_y(self) -> None:
+                super().read_y()
+                self.y_values = [value + 0.1 for value in self.y_values]
+
+        with mock.patch.object(ui_mod, "_RealDaqControl", LargeOffset):
+            win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+            try:
+                daq = self._connect_daq(win)
+                win.chk_enable.setChecked(True)
+                win._set_target_hw(1.2, 1.2)
+                for _ in range(100):
+                    win._ramp_step()
+                    if not win._ramp_timer.isActive():
+                        break
+                self.assertFalse(win._ramp_timer.isActive())
+                self.assertFalse(win._enabled)
+                self.assertEqual(win._daq_ground_state, "FAULT")
+                self.assertEqual(daq._daq.write_calls[-1], (1.2, 1.2))
+                self.assertEqual(daq._daq.write_calls.count((1.2, 1.2)), 1)
+            finally:
+                win.close()
+
+    def test_target_change_with_adc_offset_keeps_each_command_within_step(self) -> None:
+        _OffsetReadbackDaq.initial_outputs = {"ao0": 1.0, "ao1": 1.0}
+        with mock.patch.object(ui_mod, "_RealDaqControl", _OffsetReadbackDaq):
+            win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+            try:
+                daq = self._connect_daq(win)
+                initial = (win._vx, win._vy)
+                win.chk_enable.setChecked(True)
+                win._set_target_hw(2.0, 2.0)
+                for _ in range(3):
+                    win._ramp_step()
+                win._set_target_hw(0.8, 1.2)
+                for _ in range(100):
+                    win._ramp_step()
+                    if not win._ramp_timer.isActive():
+                        break
+                commands = daq._daq.write_calls
+                self.assertFalse(win._ramp_timer.isActive())
+                self.assertEqual(commands[-1], (0.8, 1.2))
+                for previous, current in zip([initial] + commands, commands):
+                    self.assertLessEqual(math.dist(previous, current), win.ramp.step_v + 1e-12)
+            finally:
+                win.close()
+
+    def test_nonfinite_feedback_during_motion_stops_further_writes(self) -> None:
+        class NonfiniteAfterWrite(_CommandOnlyDaq):
+            initial_outputs = {"ao0": 1.0, "ao1": 1.0}
+
+            def write_x(self) -> None:
+                super().write_x()
+                self.hardware.update(ao0=float("nan"), ao1=float("inf"))
+
+        for operation in ("move", "zero"):
+            with self.subTest(operation=operation), mock.patch.object(ui_mod, "_RealDaqControl", NonfiniteAfterWrite):
+                win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+                try:
+                    daq = self._connect_daq(win)
+                    if operation == "zero":
+                        win._ground_daq_outputs()
+                    else:
+                        win.chk_enable.setChecked(True)
+                        win._set_target_hw(2.0, 2.0)
+                    win._ramp_step()
+                    self.assertTrue(win._readback_uncertain)
+                    self.assertTrue(math.isfinite(win._vx) and math.isfinite(win._vy))
+                    self.assertFalse(win._ramp_timer.isActive())
+                    self.assertFalse(win._enabled)
+                    writes = len(daq._daq.write_calls)
+                    win._ramp_step()
+                    self.assertEqual(len(daq._daq.write_calls), writes)
+                finally:
+                    win.close()
+
+    def test_noisy_nonprogressing_zero_feedback_is_bounded(self) -> None:
+        class NoisyStuck(_CommandOnlyDaq):
+            initial_outputs = {"ao0": 1.0, "ao1": 1.0}
+
+            def __init__(self, device_name: str) -> None:
+                self.read_count = 0
+                super().__init__(device_name)
+
+            def read_y(self) -> None:
+                self.read_count += 1
+                self.y_values = [1.0 + (self.read_count % 2) * 0.001] * len(self._ordered_addresses)
+
+            def write_x(self) -> None:
+                self.write_calls.append(tuple(float(v) for v in self.x_values))
+
+        with mock.patch.object(ui_mod, "_RealDaqControl", NoisyStuck):
+            win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+            try:
+                daq = self._connect_daq(win)
+                win._ground_daq_outputs()
+                for _ in range(100):
+                    win._ramp_step()
+                    if not win._daq_ground_pending:
+                        break
+                self.assertFalse(win._daq_ground_pending)
+                self.assertFalse(win._ramp_timer.isActive())
+                self.assertEqual(win._daq_ground_state, "FAULT")
+                writes = len(daq._daq.write_calls)
+                self.assertLess(writes, 100)
+                win._ramp_step()
+                self.assertEqual(len(daq._daq.write_calls), writes)
+            finally:
+                win.close()
+
+    def test_zero_allows_a_full_voltage_range_ramp(self) -> None:
+        FakeDaqControl.initial_outputs = {"ao0": 10.0, "ao1": 10.0}
+        win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+        try:
+            daq = self._connect_daq(win)
+            with mock.patch.object(ui_mod.time, "monotonic", return_value=100.0) as monotonic:
+                win._ground_daq_outputs()
+                for _ in range(400):
+                    monotonic.return_value += win.ramp.dwell_ms / 1000.0
+                    win._ramp_step()
+                    if not win._daq_ground_pending:
+                        break
+                self.assertGreater(monotonic.return_value - 100.0, 28.0)
+            self.assertEqual(win._daq_ground_state, "GROUNDED")
+            self.assertEqual(daq._daq.write_calls[-1], (0.0, 0.0))
+            self.assertGreater(len(daq._daq.write_calls), 280)
+            self.assertFalse(win._ramp_timer.isActive())
+        finally:
+            win.close()
+
+    def test_expired_ramp_deadline_stops_before_another_write(self) -> None:
+        for operation in ("move", "zero"):
+            with self.subTest(operation=operation):
+                win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+                try:
+                    daq = self._connect_daq(win)
+                    with mock.patch.object(ui_mod.time, "monotonic", return_value=100.0) as monotonic:
+                        if operation == "zero":
+                            win._ground_daq_outputs()
+                        else:
+                            win.chk_enable.setChecked(True)
+                            win._set_target_hw(8.0, 2.0)
+                        win._ramp_step()
+                        writes = len(daq._daq.write_calls)
+                        self.assertIsNotNone(win._ramp_deadline)
+                        monotonic.return_value = win._ramp_deadline + 0.001
+                        win._ramp_step()
+                    self.assertFalse(win._ramp_timer.isActive())
+                    self.assertFalse(win._enabled)
+                    self.assertEqual(win._daq_ground_state, "FAULT")
+                    self.assertEqual(len(daq._daq.write_calls), writes)
+                finally:
+                    win.close()
+
+    def test_mapping_only_change_stops_offset_ramp_without_compensating_write(self) -> None:
+        _OffsetReadbackDaq.initial_outputs = {"ao0": 1.0, "ao1": 1.0}
+        with mock.patch.object(ui_mod, "_RealDaqControl", _OffsetReadbackDaq):
+            win = ui_mod.DaqXYWindow(
+                "Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {"Dev1": ["ao0", "ao1"]},
+            )
+            try:
+                daq = self._connect_daq(win)
+                win.chk_enable.setChecked(True)
+                win._set_target_hw(2.0, 2.0)
+                win._ramp_step()
+                writes = list(daq._daq.write_calls)
+                win.chk_inv_x.setChecked(True)
+                with mock.patch.object(ui_mod, "_save_persisted_mapping"):
+                    win._on_apply_mapping()
+                self.assertFalse(win._ramp_timer.isActive())
+                self.assertEqual(daq._daq.write_calls, writes)
+                self.assertEqual((win._target_vx, win._target_vy), (win._vx, win._vy))
+            finally:
+                win.close()
+
     def test_apply_mapping_save_failure_keeps_outputs_unchanged_and_ramp_stopped(self) -> None:
         win = ui_mod.DaqXYWindow(
             dev_name="Dev1",
@@ -841,6 +1141,44 @@ class WindowSafetyTests(unittest.TestCase):
             self.assertFalse(win.isFullScreen())
             self.assertTrue(win._enabled)
             self.assertEqual((win._target_rx, win._target_ry), original_target)
+            self.assertEqual(daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_compact_voltage_readout_tracks_hardware_without_writing(self) -> None:
+        win = ui_mod.DaqXYWindow(
+            "Dev1", "ao0", "ao1", MappingSettings(invert_x=True), ["Dev1"], {}
+        )
+        try:
+            daq = self._connect_daq(win)
+            win.show()
+            win._enter_compact_mode()
+            self.app.processEvents()
+
+            self.assertTrue(win.compact_lbl_hw_value.isVisible())
+            self.assertIn("X 7.000 V / Y 1.250 V", win.compact_lbl_hw_value.text())
+            daq._daq.hardware.update(ao0=2.345, ao1=9.876)
+            win._refresh_from_hardware()
+            win._sync_ui()
+            self.assertIn("X 2.345 V / Y 9.876 V", win.compact_lbl_hw_value.text())
+            self.assertEqual(daq._daq.write_calls, [])
+        finally:
+            win.close()
+
+    def test_compact_voltage_readout_marks_cached_and_disconnected_values(self) -> None:
+        win = ui_mod.DaqXYWindow("Dev1", "ao0", "ao1", MappingSettings(), ["Dev1"], {})
+        try:
+            self.assertIn("X -- V / Y -- V", win.compact_lbl_hw_value.text())
+            daq = self._connect_daq(win)
+            daq._daq.fail_readback = True
+            win._refresh_from_hardware()
+            win._sync_ui()
+            self.assertIn("cached", win.compact_lbl_hw_value.text().lower())
+            self.assertIn("X 7.000 V / Y 1.250 V", win.compact_lbl_hw_value.text())
+
+            win._on_daq_connect_clicked()
+            self.assertIn("X -- V / Y -- V", win.compact_lbl_hw_value.text())
+            self.assertNotIn("7.000", win.compact_lbl_hw_value.text())
             self.assertEqual(daq._daq.write_calls, [])
         finally:
             win.close()

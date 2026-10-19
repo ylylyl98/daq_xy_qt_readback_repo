@@ -170,9 +170,6 @@ class ANC300Positioner:
             raise ValueError(f"{axis.upper()} move must be between 1 and {maximum} steps.")
         return self._start_move(settings, axis, physical_direction, str(steps))
 
-    def start_continuous(self, settings: PositionerSettings, axis: str, direction: str) -> str:
-        return self._start_move(settings, axis, direction, "c")
-
     def step_duration(self, settings: PositionerSettings, axis: str, steps: int) -> float:
         """Conservative stepping interval, not position feedback."""
         response = self._exchange(f"getf {settings.axis_number(axis)}")
@@ -184,6 +181,18 @@ class ANC300Positioner:
         if not math.isfinite(frequency) or not 1 <= frequency <= 10000:
             raise RuntimeError(f"Invalid ANC300 frequency: {frequency}")
         return steps / frequency + 0.25
+
+    def wait_for_step(self, settings: PositionerSettings, axis: str) -> str:
+        """Wait for controller stepping completion, not position feedback.
+
+        Use only after a single step so the worker's serial wait stays bounded.
+        """
+        if not self.connected:
+            raise RuntimeError("ANC300 is not connected.")
+        axis_number = settings.axis_number(axis)
+        if axis_number not in self._axes:
+            raise RuntimeError("The saved axis mapping does not match the active ANC300 connection.")
+        return self._exchange(f"stepw {axis_number}")
 
     def _start_move(self, settings: PositionerSettings, axis: str, physical_direction: str, count: str) -> str:
         axis_number = settings.axis_number(axis)

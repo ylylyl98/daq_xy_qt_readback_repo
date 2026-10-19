@@ -29,21 +29,25 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install . pyinstaller
 
       - name: Verify tag matches application version
         shell: pwsh
         run: |
           $version = python -c "from daq_xy_qt_readback import __version__; print(__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if ("v$version" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match application version $version"
           }
 
-      - name: Run tests and source smoke check
+      - name: Run tests
         shell: pwsh
-        run: |
-          python -m unittest discover -s tests
-          python scripts/smoke_check.py
+        run: python -m unittest discover -s tests
+
+      - name: Run source smoke check
+        shell: pwsh
+        run: python scripts/smoke_check.py
 
       - name: Install Inno Setup
         shell: pwsh
@@ -69,6 +73,7 @@ jobs:
         shell: pwsh
         run: |
           $version = python -c "from daq_xy_qt_readback import __version__; print(__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $zip = "dist\DAQ-XY-Control-Portable-$version.zip"
           Compress-Archive -LiteralPath "dist\DAQ XY Control" -DestinationPath $zip
           $installer = "dist\installer\DAQ-XY-Control-Setup-$version.exe"

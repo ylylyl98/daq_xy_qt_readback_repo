@@ -106,6 +106,10 @@ ANC300 coarse XYZ motion. Connect the DAQ in Scanner and select **Enable output*
 to allow voltage changes. Enabling preserves the current voltage. Each direction
 click keeps the existing ramped `0.05 V` real-space nudge behavior.
 
+The compact Scanner page shows the current hardware X/Y output voltages in volts
+to three decimal places. Uncertain readings are marked **cached**; disconnected
+values are shown as dashes.
+
 - Click the center restore button or press `Esc` to return to the full interface.
 - When the compact window has keyboard focus, the arrow keys nudge in the matching direction.
 - Switching views does not reconnect the DAQ or change the current output or target.
@@ -190,26 +194,50 @@ sends an exact 0 V target, and verifies three consecutive readbacks within ±0.0
 Uncertain readback or a failed verification stops the operation and keeps a pending
 close from completing. These checks do not depend on ANC300 settings or connection.
 
+Hardware readback retains the measured voltage, including negative values; it is
+never clipped to zero for verification. Non-finite readings are marked uncertain.
+Readback outside the 0–10 V control range by more than 0.010 V blocks further ramp
+writes, so an out-of-range starting voltage cannot cause a sudden correction.
+
+Ramps advance from the last commanded voltage, independently of measurement noise.
+After sending the exact target, the app only reads back: ordinary moves finish
+within ±0.010 V, while zeroing requires three consecutive samples in that range.
+Verification stops after 30 unsuccessful polls. Zeroing also checks for meaningful
+progress, and every ramp has a travel-based time limit with settling and scheduling
+allowance. A failed check stops output control and leaves a pending close open.
+
 Positioner motion requires an explicit **Enable Positioner** action. Grounding sends
 STOP before switching each configured positioner axis to GND; movement never silently
 re-enables a grounded positioner axis.
 
 Both layouts offer **Step** and **Continuous** modes. Step sends the selected count
-(X/Y: 1–1000; Z: 1–100). Continuous uses the ANC300 continuous stepping command:
-hold a direction button to move and release it to stop. The step count is unused in
-Continuous mode; speed follows the controller's existing frequency and amplitude.
+(X/Y: 1–1000; Z: 1–100). Continuous repeats single-step commands (`stepu <axis> 1`
+or `stepd <axis> 1`) while a direction button is held. Release cancels further steps
+and requests STOP. The selected step count is used only in Step mode.
+Each single step waits for the controller's `stepw <axis>` completion acknowledgment.
+In Step mode with count 1, the buttons become available as soon as that reply arrives,
+without an added 250 ms guard or automatic STOP commands. Continuous starts the next
+single step after that reply, yielding to queued release/STOP requests between steps.
+The repeat rate depends on the controller's step frequency and serial round trips.
+The controller's frequency and amplitude settings are not changed.
 Changing modes, hiding the held button, losing window focus, or closing the window
 requests STOP. Other directions are locked while moving; STOP remains available.
 Compact arrow-key shortcuts apply only in Step mode; Continuous uses the held buttons.
 
-Finite moves stay busy for the interval estimated from step count / queried frequency
+Moves with more than one step stay busy for the interval estimated from step count / queried frequency
 plus 250 ms, then send STOP and wait for acknowledgment before accepting another move.
-This is a conservative timing guard, not position feedback or an arrival measurement.
+This is a conservative timing guard. Neither timing nor `stepw` provides position
+feedback or an arrival measurement. The blocking `stepw` command is used only for
+single steps; longer moves keep the timer so STOP can interrupt them.
 Do not change the controller frequency externally during a move. Explicit busy/moving
 rejections are stopped and shown in the status text without disconnecting after STOP
 succeeds. Other command/communication failures remain errors. Stop requests are handled
 after any serial exchange already in progress; a lost connection cannot guarantee a
-hardware stop. These controls must be verified on the connected instrument before use.
+hardware stop. An unconfirmed STOP is remembered even after the repeat timer is
+cancelled; disconnect and shutdown retry it. If the serial connection was lost,
+restore the original COM port, baud rate, and axis mapping so STOP can be confirmed
+before changing connections or starting another move. These controls must be verified
+on the connected instrument before use.
 
 ## Troubleshooting
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from contextlib import ExitStack
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 from PyQt6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
@@ -67,6 +69,7 @@ from .coordinate_transform import (
 )
 
 STEP_PER_MOVE = 0.05
+DAQ_TARGET_TOLERANCE_V = 0.01
 DAQ_ZERO_TOLERANCE_V = 0.01
 DAQ_ZERO_STABLE_SAMPLES = 3
 # A zero command must settle within a bounded number of readback polls.  At the
@@ -431,8 +434,10 @@ class DaqInterface:
     def _cache_outputs_without_writing(self, vx: float, vy: float) -> None:
         # Keep the driver-side command cache aligned with the preserved live outputs,
         # but do not issue any AO write during startup/shutdown/reconnect.
-        self._vx = clamp_voltage(vx)
-        self._vy = clamp_voltage(vy)
+        if not math.isfinite(vx) or not math.isfinite(vy):
+            raise ValueError("DAQ output values must be finite.")
+        self._vx = float(vx)
+        self._vy = float(vy)
         self._daq.receive_x(self._name_x, self._vx)
         self._daq.receive_x(self._name_y, self._vy)
 
@@ -444,7 +449,7 @@ class DaqInterface:
                 return None
             vx = float(x_vals[x_indexes[self._name_x]])
             vy = float(x_vals[x_indexes[self._name_y]])
-            return clamp_voltage(vx), clamp_voltage(vy)
+            return (vx, vy) if math.isfinite(vx) and math.isfinite(vy) else None
         except Exception:
             return None
 
@@ -452,7 +457,9 @@ class DaqInterface:
         self._daq.read_y()
         mx = float(self._daq.send_y("measured_" + self._name_x))
         my = float(self._daq.send_y("measured_" + self._name_y))
-        return clamp_voltage(mx), clamp_voltage(my)
+        if not math.isfinite(mx) or not math.isfinite(my):
+            raise ValueError("Hardware AO readback contains a non-finite voltage.")
+        return mx, my
 
     def _preserve_existing_outputs_on_connect(self) -> tuple[float, float]:
         try:
@@ -525,7 +532,9 @@ class DaqInterface:
         return self._vx, self._vy
 
     def write_outputs(self, vx: float, vy: float) -> tuple[float, float]:
-        self._cache_outputs_without_writing(vx, vy)
+        if not math.isfinite(vx) or not math.isfinite(vy):
+            raise ValueError("DAQ output commands must be finite.")
+        self._cache_outputs_without_writing(clamp_voltage(vx), clamp_voltage(vy))
         self._daq.write_x()
         return self.read_outputs()
 
@@ -773,20 +782,50 @@ class _PositionerWorker(QObject):
         super().__init__()
         self._positioner = ANC300Positioner()
         self._motion_active = False
+        self._stop_required = False
+        self._connection_settings: PositionerSettings | None = None
+        self._continuous_move: tuple[PositionerSettings, str, str] | None = None
         self._motion_timer = QTimer(self)
         self._motion_timer.setSingleShot(True)
         self._motion_timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._motion_timer.timeout.connect(self.stop_all)
+        self._motion_timer.timeout.connect(self._advance_motion)
 
     def _cancel_motion_timer(self) -> None:
         self._motion_timer.stop()
         self._motion_active = False
+        self._continuous_move = None
+
+    def _confirm_stop(self) -> None:
+        # Cancelling scheduled work does not confirm that the controller stopped.
+        if self._stop_required and not self._positioner.connected:
+            raise RuntimeError("ANC300 is disconnected; STOP could not be confirmed.")
+        self._positioner.stop_all()
+        self._stop_required = False
+
+    @pyqtSlot()
+    def _advance_motion(self) -> None:
+        if not self._motion_active:
+            return
+        if self._continuous_move is None:
+            self.stop_all()
+            return
+        try:
+            settings, axis, direction = self._continuous_move
+            self._stop_required = True
+            self._positioner.move(settings, axis, direction, 1)
+            self._positioner.wait_for_step(settings, axis)
+            # Yield to queued STOP/release requests before starting the next step.
+            self._motion_timer.start(1)
+        except ANC300BusyError:
+            self._motion_rejected_busy()
+        except Exception as exc:
+            self._motion_failed(exc)
 
     def _motion_failed(self, exc: Exception) -> None:
         self._cancel_motion_timer()
         detail = str(exc)
         try:
-            self._positioner.stop_all()
+            self._confirm_stop()
         except Exception as stop_error:
             detail += f"; STOP could not be confirmed: {stop_error}"
         try:
@@ -798,7 +837,7 @@ class _PositionerWorker(QObject):
     def _motion_rejected_busy(self) -> None:
         self._cancel_motion_timer()
         try:
-            self._positioner.stop_all()
+            self._confirm_stop()
             self.operation_finished.emit("Controller was busy; STOP acknowledged. Retry the move.")
         except Exception as exc:
             self._motion_failed(exc)
@@ -808,18 +847,45 @@ class _PositionerWorker(QObject):
         try:
             assert isinstance(settings, PositionerSettings)
             self.operation_started.emit("Connecting")
+            if self._stop_required:
+                self._cancel_motion_timer()
+                if self._positioner.connected:
+                    # Stop the original connection before connect() can close it
+                    # and replace its port or configured axes.
+                    self._confirm_stop()
+                else:
+                    previous = self._connection_settings
+                    identity_fields = ("port", "baudrate", "x_axis", "y_axis", "z_axis")
+                    if previous is None or any(
+                        getattr(settings, field) != getattr(previous, field) for field in identity_fields
+                    ):
+                        original = (
+                            f"{previous.port}, axes {previous.x_axis}, {previous.y_axis}, {previous.z_axis}"
+                            if previous is not None else "the original connection"
+                        )
+                        self.failed.emit(
+                            f"STOP remains unconfirmed on {original}. "
+                            "Restore the original port, baud rate, and axis mapping before reconnecting."
+                        )
+                        return
             version = self._positioner.connect(settings)
+            self._connection_settings = settings
+            if self._stop_required:
+                self._confirm_stop()
             self.connected.emit(version)
             self.operation_finished.emit("Connected")
         except Exception as exc:
-            self.failed.emit(str(exc))
+            if self._stop_required:
+                self._motion_failed(exc)
+            else:
+                self.failed.emit(str(exc))
 
     @pyqtSlot()
     def disconnect_device(self) -> None:
+        self._cancel_motion_timer()
         try:
-            if self._motion_active:
-                self._positioner.stop_all()
-            self._cancel_motion_timer()
+            if self._stop_required:
+                self._confirm_stop()
             self._positioner.close()
             self.disconnected.emit("Disconnected — serial port released")
         except Exception as exc:
@@ -829,13 +895,23 @@ class _PositionerWorker(QObject):
     def move(self, settings: object, axis: str, direction: str, steps: int) -> None:
         if self._motion_active:
             return
+        if self._stop_required:
+            self._motion_rejected_busy()
+            return
         try:
             assert isinstance(settings, PositionerSettings)
             self.operation_started.emit(f"Stepping {direction}")
-            duration = self._positioner.step_duration(settings, axis, steps)
+            duration = None if steps == 1 else self._positioner.step_duration(settings, axis, steps)
             self._motion_active = True
+            self._stop_required = True
             self._positioner.move(settings, axis, direction, steps)
-            self._motion_timer.start(max(1, int(duration * 1000 + 1)))
+            if duration is None:
+                self._positioner.wait_for_step(settings, axis)
+                self._stop_required = False
+                self._cancel_motion_timer()
+                self.operation_finished.emit("Single step finished; controller completion acknowledged")
+            else:
+                self._motion_timer.start(max(1, int(duration * 1000 + 1)))
         except ANC300BusyError:
             self._motion_rejected_busy()
         except Exception as exc:
@@ -845,11 +921,15 @@ class _PositionerWorker(QObject):
     def start_continuous(self, settings: object, axis: str, direction: str) -> None:
         if self._motion_active:
             return
+        if self._stop_required:
+            self._motion_rejected_busy()
+            return
         try:
             assert isinstance(settings, PositionerSettings)
+            self.operation_started.emit(f"Continuous single-step {direction}; release to stop")
             self._motion_active = True
-            self.operation_started.emit(f"Continuous {direction}; release to stop")
-            self._positioner.start_continuous(settings, axis, direction)
+            self._continuous_move = (settings, axis, direction)
+            self._advance_motion()
         except ANC300BusyError:
             self._motion_rejected_busy()
         except Exception as exc:
@@ -860,7 +940,7 @@ class _PositionerWorker(QObject):
         self._cancel_motion_timer()
         try:
             self.operation_started.emit("Stopping")
-            self._positioner.stop_all()
+            self._confirm_stop()
             self.operation_finished.emit("Stepping stopped; STOP acknowledged")
         except Exception as exc:
             self._motion_failed(exc)
@@ -871,6 +951,7 @@ class _PositionerWorker(QObject):
         try:
             self.operation_started.emit("Grounding")
             detail = self._positioner.ground_all()
+            self._stop_required = False
             self.positioner_grounded.emit(detail)
         except Exception as exc:
             self._positioner.close()
@@ -879,6 +960,9 @@ class _PositionerWorker(QObject):
     @pyqtSlot()
     def enable_all(self) -> None:
         if self._motion_active:
+            return
+        if self._stop_required:
+            self._motion_rejected_busy()
             return
         try:
             self.operation_started.emit("Enabling stepping")
@@ -890,13 +974,13 @@ class _PositionerWorker(QObject):
 
     @pyqtSlot()
     def shutdown(self) -> None:
+        self._cancel_motion_timer()
         try:
-            if self._motion_active:
-                self._positioner.stop_all()
+            if self._stop_required:
+                self._confirm_stop()
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
-            self._cancel_motion_timer()
             try:
                 self._positioner.close()
             except Exception as exc:
@@ -984,7 +1068,7 @@ class DaqXYWindow(QMainWindow):
         self._daq_ground_stable_samples = 0
         self._daq_ground_verify_attempts = 0
         self._daq_ground_command_written = False
-        self._daq_ground_last_readback: tuple[float, float] | None = None
+        self._daq_ground_best_distance = 0.0
         self._daq_ground_stall_attempts = 0
         self._close_pending = False
         self._close_approved = False
@@ -1009,6 +1093,10 @@ class DaqXYWindow(QMainWindow):
         self._target_ry = self._ry
 
         self.ramp = RampConfig()
+        self._ramp_command: tuple[float, float] | None = None
+        self._ramp_commanded_target: tuple[float, float] | None = None
+        self._ramp_verify_attempts = 0
+        self._ramp_deadline: float | None = None
         self._ramp_timer = QTimer(self)
         self._ramp_timer.timeout.connect(self._ramp_step)
 
@@ -1260,7 +1348,7 @@ class DaqXYWindow(QMainWindow):
         step_row.addWidget(QLabel("Step count"))
         self.cmb_positioner_motion = QComboBox()
         self.cmb_positioner_motion.addItems(["Step", "Continuous"])
-        self.cmb_positioner_motion.setToolTip("Continuous: hold a direction to move; release to stop.")
+        self.cmb_positioner_motion.setToolTip("Continuous: hold to repeat 1 step at a time; release to stop.")
         step_row.addWidget(self.cmb_positioner_motion)
         self.spn_positioner_steps = QSpinBox()
         self.spn_positioner_steps.setRange(1, 1000)
@@ -1401,12 +1489,15 @@ class DaqXYWindow(QMainWindow):
         self.compact_btn_daq_connect.setProperty("role", "primary")
         self.compact_btn_daq_connect.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         layout.addWidget(self._hbox(self.compact_lbl_scanner_state, self.compact_btn_daq_connect), 0, 0, 1, 3)
-        layout.addWidget(self.compact_btn_up, 1, 1, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.compact_btn_left, 2, 0, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.compact_btn_center, 2, 1)
-        layout.addWidget(self.compact_btn_right, 2, 2, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.compact_btn_down, 3, 1, Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(QLabel(f"Nudge {STEP_PER_MOVE:.2f} V"), 4, 0, 1, 3, Qt.AlignmentFlag.AlignCenter)
+        self.compact_lbl_hw_value = self._metric_label("DAQ output\nX -- V / Y -- V")
+        self.compact_lbl_hw_value.setAccessibleName("DAQ X and Y output voltages")
+        layout.addWidget(self.compact_lbl_hw_value, 1, 0, 1, 3)
+        layout.addWidget(self.compact_btn_up, 2, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_left, 3, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_center, 3, 1)
+        layout.addWidget(self.compact_btn_right, 3, 2, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.compact_btn_down, 4, 1, Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(QLabel(f"Nudge {STEP_PER_MOVE:.2f} V"), 5, 0, 1, 3, Qt.AlignmentFlag.AlignCenter)
         self.compact_btn_scanner_enable = QPushButton("Enable output")
         self.compact_btn_scanner_enable.setCheckable(True)
         self.compact_btn_scanner_enable.setProperty("role", "primary")
@@ -1420,13 +1511,13 @@ class DaqXYWindow(QMainWindow):
         self.compact_btn_stop_scanner_ramp.setProperty("role", "secondary")
         self.compact_btn_stop_scanner_ramp.setToolTip(self.btn_stop_scanner_ramp.toolTip())
         self.compact_btn_scanner_enable.setToolTip(self.chk_enable.toolTip())
-        layout.addWidget(self.compact_btn_stop_scanner_ramp, 5, 0, 1, 3)
+        layout.addWidget(self.compact_btn_stop_scanner_ramp, 6, 0, 1, 3)
         for button in (self.compact_btn_scanner_enable, self.compact_btn_daq_ground):
             button.setMinimumHeight(32)
-        layout.addWidget(self._hbox(self.compact_btn_scanner_enable, self.compact_btn_daq_ground), 6, 0, 1, 3)
+        layout.addWidget(self._hbox(self.compact_btn_scanner_enable, self.compact_btn_daq_ground), 7, 0, 1, 3)
         layout.setRowStretch(0, 1)
-        layout.setRowStretch(1, 1)
         layout.setRowStretch(2, 1)
+        layout.setRowStretch(3, 1)
         layout.setColumnStretch(0, 1)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(2, 1)
@@ -1448,7 +1539,7 @@ class DaqXYWindow(QMainWindow):
         step_row.addWidget(QLabel("Steps"))
         self.compact_cmb_positioner_motion = QComboBox()
         self.compact_cmb_positioner_motion.addItems(["Step", "Continuous"])
-        self.compact_cmb_positioner_motion.setToolTip("Continuous: hold a direction to move; release to stop.")
+        self.compact_cmb_positioner_motion.setToolTip(self.cmb_positioner_motion.toolTip())
         step_row.addWidget(self.compact_cmb_positioner_motion)
         self.compact_spn_positioner_steps = QSpinBox()
         self.compact_spn_positioner_steps.setRange(1, 1000)
@@ -1796,7 +1887,7 @@ class DaqXYWindow(QMainWindow):
 
     @staticmethod
     def _compact_size_for_tab(index: int) -> QSize:
-        return QSize(360, 480) if index == 1 else QSize(360, 440)
+        return QSize(360, 480)
 
     def _apply_compact_tab_size(self, index: int | None = None) -> None:
         if not self._compact_mode:
@@ -2440,6 +2531,13 @@ class DaqXYWindow(QMainWindow):
         for label in (self.lbl_daq_status, self.compact_lbl_scanner_state):
             self._set_chip(label, summary, style)
             label.setToolTip(self._daq_detail + "\n" + self._readback_status)
+        if self._daq_connected and not self._demo_reason:
+            title = "DAQ output (cached)" if self._readback_uncertain else "DAQ output"
+            self.compact_lbl_hw_value.setText(f"{title}\nX {self._vx:.3f} V / Y {self._vy:.3f} V")
+            self.compact_lbl_hw_value.setToolTip(self._readback_status)
+        else:
+            self.compact_lbl_hw_value.setText("DAQ output\nX -- V / Y -- V")
+            self.compact_lbl_hw_value.setToolTip("Connect the DAQ to read scanner output voltages.")
         if hasattr(self, "btn_apply"):
             self._update_mapping_dirty()
 
@@ -2473,6 +2571,7 @@ class DaqXYWindow(QMainWindow):
 
     def _on_daq_disconnected(self, detail: str = "DAQ disconnected; AO outputs were left unchanged.") -> None:
         self._ramp_timer.stop()
+        self._reset_ramp_tracking()
         self._close_pending = False
         self._close_approved = False
         self._daq_ground_pending = False
@@ -2524,7 +2623,7 @@ class DaqXYWindow(QMainWindow):
             return
         self._positioner_hold_button = button
         self._positioner_busy = True
-        self._update_positioner_controls(f"Continuous {direction}; release to stop")
+        self._update_positioner_controls(f"Continuous single-step {direction}; release to stop")
         self._positioner_continuous_requested.emit(self._positioner_settings, axis, direction)
 
     def _release_positioner_hold(self, button: QPushButton | None = None) -> None:
@@ -2732,6 +2831,7 @@ class DaqXYWindow(QMainWindow):
             self._daq_ground_state = "READY"
 
     def _freeze_targets_at_current_output(self) -> None:
+        self._reset_ramp_tracking()
         self._target_vx = self._vx
         self._target_vy = self._vy
         self._target_rx = self._rx
@@ -2745,7 +2845,7 @@ class DaqXYWindow(QMainWindow):
     def _set_target_hw(self, vx: float, vy: float) -> None:
         if self._daq_ground_pending:
             return
-        if self._daq_ground_state == "GROUNDED":
+        if self._daq_ground_state in {"GROUNDED", "FAULT"}:
             self._daq_ground_state = "READY"
         self._target_vx = clamp_voltage(vx)
         self._target_vy = clamp_voltage(vy)
@@ -2860,7 +2960,7 @@ class DaqXYWindow(QMainWindow):
         self._daq_ground_stable_samples = 0
         self._daq_ground_verify_attempts = 0
         self._daq_ground_command_written = False
-        self._daq_ground_last_readback = (self._vx, self._vy)
+        self._daq_ground_best_distance = math.hypot(self._vx, self._vy)
         self._daq_ground_stall_attempts = 0
         self._enabled = True
         self.chk_enable.blockSignals(True)
@@ -2912,13 +3012,11 @@ class DaqXYWindow(QMainWindow):
             self._close_approved = True
             QTimer.singleShot(0, self.close)
 
-    def _fail_zero_verification(self, detail: str) -> None:
-        """Stop a zero transition after bounded readback attempts."""
+    def _fail_daq_ramp(self, detail: str) -> None:
         self._ramp_timer.stop()
-        if self._daq_ground_pending:
-            self._daq_ground_pending = False
-            self._daq_ground_state = "FAULT"
-            self._daq_detail = detail
+        self._daq_ground_pending = False
+        self._daq_ground_state = "FAULT"
+        self._daq_detail = detail
         self._enabled = False
         self.chk_enable.blockSignals(True)
         self.chk_enable.setChecked(False)
@@ -2937,23 +3035,65 @@ class DaqXYWindow(QMainWindow):
         self._daq_detail = "DAQ ramp stopped at its current output."
         self._sync_ui()
 
-    def _start_ramp(self) -> None:
+    def _reset_ramp_tracking(self) -> None:
+        self._ramp_command = None
+        self._ramp_commanded_target = None
+        self._ramp_verify_attempts = 0
+        self._ramp_deadline = None
+
+    def _daq_readback_in_control_range(self) -> bool:
+        return all(
+            math.isfinite(value)
+            and self._vmin - DAQ_TARGET_TOLERANCE_V <= value <= self._vmax + DAQ_TARGET_TOLERANCE_V
+            for value in (self._vx, self._vy)
+        )
+
+    def _daq_is_at_target(self) -> bool:
+        return bool(
+            not self._readback_uncertain
+            and abs(self._vx - self._target_vx) <= DAQ_TARGET_TOLERANCE_V
+            and abs(self._vy - self._target_vy) <= DAQ_TARGET_TOLERANCE_V
+        )
+
+    def _start_ramp(self, *, resume: bool = False) -> None:
         if self.ramp.dwell_ms <= 0:
             self.ramp.dwell_ms = 50
+        if not math.isfinite(self.ramp.step_v) or self.ramp.step_v <= 0:
+            self._fail_daq_ramp("DAQ ramp step must be a positive finite voltage.")
+            return
+        if self._readback_uncertain or not self._daq_readback_in_control_range():
+            self._fail_daq_ramp("DAQ ramp withheld: readback is uncertain or outside the 0–10 V control range.")
+            return
+        if not resume or self._ramp_command is None:
+            if not self._ramp_timer.isActive() or self._ramp_command is None:
+                # Allow boundary readback noise, but keep commands within range.
+                self._ramp_command = (clamp_voltage(self._vx), clamp_voltage(self._vy))
+            self._ramp_commanded_target = None
+            self._ramp_verify_attempts = 0
+            distance = math.hypot(self._target_vx - self._ramp_command[0], self._target_vy - self._ramp_command[1])
+            expected_ticks = math.ceil(distance / self.ramp.step_v) + ZERO_VERIFY_MAX_ATTEMPTS
+            # Cover the full travel plus settling, with room for Qt scheduling.
+            self._ramp_deadline = time.monotonic() + 2 * expected_ticks * self.ramp.dwell_ms / 1000.0
         if not self._ramp_timer.isActive():
             self._ramp_timer.start(self.ramp.dwell_ms)
 
     def _ramp_step(self) -> None:
-        if not self._enabled or not self._daq_connected or self._daq is None:
+        if not self._enabled or not self._daq_connected or self._daq is None or self._ramp_command is None:
             self._ramp_timer.stop()
             return
-        dx = self._target_vx - self._vx
-        dy = self._target_vy - self._vy
-        if (
-            self._daq_ground_pending
-            and self._daq_ground_command_written
-        ):
-            self._daq_ground_verify_attempts += 1
+        if self._ramp_deadline is not None and time.monotonic() >= self._ramp_deadline:
+            self._fail_daq_ramp("DAQ ramp exceeded its travel and verification time limit; output control stopped.")
+            return
+        if self._readback_uncertain or not self._daq_readback_in_control_range():
+            self._fail_daq_ramp("DAQ ramp stopped: readback is uncertain or outside the 0–10 V control range.")
+            return
+        target = (self._target_vx, self._target_vy)
+        if self._ramp_commanded_target == target:
+            # Once the exact command is sent, only read. ADC noise must never
+            # produce an endless series of corrective writes to the same target.
+            self._ramp_verify_attempts += 1
+            if self._daq_ground_pending:
+                self._daq_ground_verify_attempts += 1
             try:
                 self._vx, self._vy = self._daq.read_outputs()
                 self._readback_uncertain = bool(getattr(self._daq, "readback_uncertain", False))
@@ -2963,51 +3103,56 @@ class DaqXYWindow(QMainWindow):
                 self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
             except Exception:
                 self._readback_uncertain = True
-            if self._daq_is_verified_zero():
-                self._daq_ground_stable_samples += 1
-            else:
-                self._daq_ground_stable_samples = 0
-            self._sync_ui()
-            if self._daq_ground_verify_attempts >= ZERO_VERIFY_MAX_ATTEMPTS:
-                self._fail_zero_verification(
-                    "DAQ zero readback did not remain verified; grounding stopped and the window stayed open."
-                )
+            if self._readback_uncertain or not self._daq_readback_in_control_range():
+                self._fail_daq_ramp("DAQ target verification failed: readback is uncertain or outside the control range.")
                 return
-            if self._daq_ground_stable_samples >= DAQ_ZERO_STABLE_SAMPLES:
+            if self._daq_ground_pending:
+                if self._daq_is_verified_zero():
+                    self._daq_ground_stable_samples += 1
+                else:
+                    self._daq_ground_stable_samples = 0
+                if self._daq_ground_stable_samples >= DAQ_ZERO_STABLE_SAMPLES:
+                    self._ramp_timer.stop()
+                    self._finish_daq_ground()
+                    return
+            elif self._daq_is_at_target():
                 self._ramp_timer.stop()
-                self._finish_daq_ground()
+                self._daq_detail = "DAQ target reached within ±0.010 V readback tolerance."
+                self._sync_ui()
+                return
+            if self._ramp_verify_attempts >= ZERO_VERIFY_MAX_ATTEMPTS:
+                self._fail_daq_ramp("DAQ target readback did not settle within tolerance; output control stopped.")
+                return
+            self._sync_ui()
             return
-        if (
-            abs(dx) < 1e-6
-            and abs(dy) < 1e-6
-            and not self._daq_ground_pending
-        ):
-            self._ramp_timer.stop()
-            return
-        nx, ny = _next_ramp_point(self._vx, self._vy, self._target_vx, self._target_vy, self.ramp.step_v)
+        nx, ny = _next_ramp_point(*self._ramp_command, *target, self.ramp.step_v)
         try:
             self._vx, self._vy = self._daq.write_outputs(nx, ny)
-            if self._daq_ground_pending and abs(nx) < 1e-12 and abs(ny) < 1e-12:
+            self._ramp_command = (nx, ny)
+            if (nx, ny) == target:
+                self._ramp_commanded_target = target
+            if self._daq_ground_pending and (nx, ny) == (0.0, 0.0):
                 self._daq_ground_command_written = True
             self._readback_uncertain = bool(getattr(self._daq, "readback_uncertain", False))
             self._readback_status = str(
                 getattr(self._daq, "readback_status", "Hardware AO readback status is unavailable.")
             )
             self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
-            if self._daq_ground_pending and self._readback_uncertain:
-                self._fail_zero_verification(
-                    "DAQ readback became uncertain during grounding; no further DAQ writes were issued."
+            if self._readback_uncertain or not self._daq_readback_in_control_range():
+                self._fail_daq_ramp(
+                    "DAQ readback became uncertain or left the control range; no further DAQ writes were issued."
                 )
                 return
             if self._daq_ground_pending and not self._daq_ground_command_written:
-                previous = self._daq_ground_last_readback
-                if previous is not None and abs(self._vx - previous[0]) < 1e-9 and abs(self._vy - previous[1]) < 1e-9:
-                    self._daq_ground_stall_attempts += 1
-                else:
+                distance = math.hypot(self._vx, self._vy)
+                progress_threshold = min(DAQ_ZERO_TOLERANCE_V, self.ramp.step_v / 4)
+                if self._daq_ground_best_distance - distance >= progress_threshold:
+                    self._daq_ground_best_distance = distance
                     self._daq_ground_stall_attempts = 0
-                self._daq_ground_last_readback = (self._vx, self._vy)
+                else:
+                    self._daq_ground_stall_attempts += 1
                 if self._daq_ground_stall_attempts >= ZERO_VERIFY_MAX_ATTEMPTS:
-                    self._fail_zero_verification(
+                    self._fail_daq_ramp(
                         "DAQ output did not progress toward zero; grounding stopped and the window stayed open."
                     )
                     return
@@ -3045,13 +3190,14 @@ class DaqXYWindow(QMainWindow):
                 self._mapping.rotation_enabled,
                 self._mapping.rotation_deg,
             )
-        self._sync_ui()
         if (
             not self._daq_ground_pending
-            and abs(self._target_vx - self._vx) < 1e-6
-            and abs(self._target_vy - self._vy) < 1e-6
+            and self._ramp_commanded_target == target
+            and self._daq_is_at_target()
         ):
             self._ramp_timer.stop()
+            self._daq_detail = "DAQ target reached within ±0.010 V readback tolerance."
+        self._sync_ui()
 
     def _on_rescan_devices(self) -> None:
         devices, channels_by_device, err = _detect_devices_and_channels()
@@ -3122,6 +3268,7 @@ class DaqXYWindow(QMainWindow):
                 self._ao_y = chy
 
             # Mapping changes do not command movement; they only change interpretation.
+            self._ramp_timer.stop()
             self._mapping = new_mapping
             self._update_pad_projection()
             if device_or_channel_changed and self._daq_connected:
@@ -3129,10 +3276,7 @@ class DaqXYWindow(QMainWindow):
             else:
                 # Keep hardware setpoints unchanged; only remap display coordinates.
                 self._rx, self._ry = map_hw_to_real(self._vx, self._vy, self._mapping)
-                self._target_vx = self._vx
-                self._target_vy = self._vy
-                self._target_rx = self._rx
-                self._target_ry = self._ry
+                self._freeze_targets_at_current_output()
             self._sync_ui()
         except Exception as exc:
             # If the apply failed after stopping an in-flight ramp, restart the ramp
@@ -3147,7 +3291,7 @@ class DaqXYWindow(QMainWindow):
                     "Apply Mapping failed; restarting interrupted ramp towards previous target "
                     "using existing DAQ connection. Error: %s", exc
                 )
-                self._start_ramp()
+                self._start_ramp(resume=True)
             self._sync_ui()
             QMessageBox.warning(self, "Apply Mapping", str(exc))
             return
