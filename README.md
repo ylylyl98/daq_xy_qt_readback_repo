@@ -15,7 +15,7 @@ PyQt6 desktop UI for controlling NI-DAQ analog outputs (`AO0`/`AO1`) from an XY 
 
 ### Install a released version
 
-[Download DAQ XY Control 1.2.0 for Windows](https://github.com/ylylyl98/daq_xy_qt_readback_repo/releases/latest/download/DAQ-XY-Control-Setup-1.2.0.exe)
+[Download DAQ XY Control 1.3.0 for Windows](https://github.com/ylylyl98/daq_xy_qt_readback_repo/releases/latest/download/DAQ-XY-Control-Setup-1.3.0.exe)
 
 Run the downloaded installer. It includes Python, PyQt, and the application packages;
 users do not need to install Python. Vendor hardware drivers, including NI-DAQmx,
